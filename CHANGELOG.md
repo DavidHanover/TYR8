@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.11
+- The road is a street: wider, with a curb, a sidewalk and grass behind it, all scrolling.
+- Knock makes the road rough instead of drawing ridges: rocks in the tyre's path, which it hops over, cracks in the
+  pavement, and from 40 % weeds growing in them.
+
+## 0.9.10
+- The back of the tyre is hidden by the tyre: its far rim is drawn only where it shows, along the outline, not
+  across the tread at the top and bottom (most visible on the slick).
+
 ## 0.9.9
 - POLY is gone: it sounded bad and six full voices were too much for the OP-1. Orange's push switches between
   `MONO GLIDE` and `MONO RETRIG`; a sound saved in POLY plays in `MONO GLIDE`.
