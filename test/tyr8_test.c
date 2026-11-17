@@ -129,6 +129,8 @@ typedef struct { int n; op1_pt p[96]; uint8_t c[4]; } hpoly;
 static hline lines[4096]; static int nlines;
 static hpoly polys[256]; static int npolys;
 static int ops[8192], nops;                   /* >= 0: a line, < 0: polygon -1 - i */
+static int dyn_from;                          /* the first op of the moving parts (the labels are a still layer) */
+void host_mark_dynamic(void) { dyn_from = nops; }
 uint16_t host_frame565[400 * 256];
 void host_screen_draw(void *scr, int dt) { (void)scr; (void)dt; }
 void *host_raster(void) { return (void *)1; }
@@ -145,7 +147,7 @@ static FILE *fj; static int nframes;
 static void dump(const char *label)
 {
     if (!fj) return;
-    fprintf(fj, "%s{\"label\":\"%s\",\"ops\":[", nframes++ ? ",\n" : "", label);
+    fprintf(fj, "%s{\"label\":\"%s\",\"dyn\":%d,\"ops\":[", nframes++ ? ",\n" : "", label, dyn_from);
     for (int i = 0; i < nops; i++) {
         if (i) fputc(',', fj);
         if (ops[i] >= 0) { const hline *l = &lines[ops[i]]; fprintf(fj, "[\"L\",%d,%d,%d,%d,%d,%d,%d,%d]", l->x0, l->y0, l->x1, l->y1, l->w, l->c[0], l->c[1], l->c[2]); }
@@ -160,12 +162,45 @@ static void dump(const char *label)
 }
 static void frame_of(const op1_screen_t *scr, const char *label)
 {
-    nlines = npolys = nops = 0;
+    nlines = npolys = nops = dyn_from = 0;
     for (int i = 0; i < 400 * 256; i++) host_frame565[i] = 0xFFFF;
     scr->update(0, 16);
     dump(label);
 }
 static void frame(const char *label) { frame_of(&SCREEN_tyr8, label); }
+
+/* is the point (Q10 px), m px around it, inside the moving area the screen declares (DYN in ty_screen_update) */
+static int in_dyn(double x, double y, double m)
+{
+    static const int R[5][4] = { { 106, 0, 216, 159 }, { 0, 22, 105, 103 }, { 0, 121, 105, 159 }, { 217, 22, 319, 103 }, { 217, 134, 319, 159 } };
+    for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) {
+        const double px = x / 1024 + dx * m, py = y / 1024 + dy * m;
+        int in = 0;
+        for (int k = 0; k < 5 && !in; k++) in = px >= R[k][0] && px < R[k][2] + 1 && py >= R[k][1] && py < R[k][3] + 1;
+        if (!in) return 0;
+    }
+    return 1;
+}
+/* moving ops of the last frame that leave the moving area (lines with their stroke, fill corners) */
+static int dyn_escapes(void)
+{
+    int bad = 0;
+    for (int i = dyn_from; i < nops; i++) {
+        if (ops[i] >= 0) {
+            const hline *l = &lines[ops[i]];
+            for (int k = 0; k <= 8; k++)
+                if (!in_dyn(l->x0 + (l->x1 - l->x0) * k / 8.0, l->y0 + (l->y1 - l->y0) * k / 8.0, l->w / 2048.0 + 0.25)) {
+                    static int shown; if (shown++ < 6) printf("      escape: line (%.1f, %.1f) - (%.1f, %.1f) colour %02x%02x%02x\n", l->x0 / 1024.0, l->y0 / 1024.0, l->x1 / 1024.0, l->y1 / 1024.0, l->c[0], l->c[1], l->c[2]);
+                    bad++; break; }
+        } else {
+            const hpoly *q = &polys[-1 - ops[i]];
+            for (int j = 0; j < q->n; j++) if (!in_dyn(q->p[j].x, q->p[j].y, 0.5)) {
+                static int shownp; if (shownp++ < 4) printf("      escape: fill corner (%.1f, %.1f)\n", q->p[j].x / 1024.0, q->p[j].y / 1024.0);
+                bad++; break; }
+        }
+    }
+    return bad;
+}
 
 /* inside a convex polygon (either winding), Q10 px */
 static int in_convex(const op1_pt *p, int n, double x, double y)
@@ -586,7 +621,7 @@ int main(int argc, char **argv)
     host_knobs[0][1] = 20000;
     for (int i = 0; i < 60; i++) frame("monster truck, off-road lugs, at rest");
     near_shape(&low, &fw, &ht);
-    CHECK(ht > ht_small * 1.6 * 1.1, "decay sets the size, and clip the lugs: %.1f px high at the smallest slick, %.1f at the largest with lugs", ht_small, ht);
+    CHECK(ht > ht_small * 1.5, "decay sets the size, and clip the lugs: %.1f px high at the smallest slick, %.1f at the largest with lugs", ht_small, ht);
     host_knobs[0][6] = 0; frame("big slick"); double ht_slick; near_shape(&low, &fw, &ht_slick);
     host_knobs[0][5] = 32767; frame("big, clip 0, drive full"); double ht_drv; near_shape(&low, &fw, &ht_drv);
     CHECK(fabs(ht_drv - ht) < 0.6, "drive alone raises the lugs as clip does: the higher of the two (%.1f and %.1f px)", ht_drv, ht);
@@ -613,17 +648,20 @@ int main(int argc, char **argv)
     sub(32767); sag(32767);
     vis_trig++; vis_lvl = 32767; vis_inc = (uint32_t)(55 / 88200.0 * 4294967296.0);
     const int32_t rest = vis_hub_y;
-    int32_t top = rest; uint32_t a0 = ang; int offscreen = 0, shadow = 0;
+    int32_t top = rest; uint32_t a0 = ang; int offscreen = 0, shadow = 0, escapes = 0;
     for (int i = 0; i < 90; i++) {
         frame(i == 6 ? "note on: bounce" : i == 30 ? "rolling" : "rolling on");
         if (vis_hub_y < top) top = vis_hub_y;
         if (i == 6) for (int j = 0; j < nlines; j++) shadow += lines[j].c[0] == 0x6F && lines[j].y0 > OP1_Q10(115);
         for (int j = 0; j < nlines; j++) if (lines[j].y1 > OP1_Q10(150) || lines[j].y0 > OP1_Q10(150) || lines[j].x0 < OP1_Q10(2) || lines[j].x1 < OP1_Q10(2) || lines[j].x0 > OP1_Q10(318) || lines[j].x1 > OP1_Q10(318) || lines[j].y0 < OP1_Q10(2) || lines[j].y1 < OP1_Q10(2)) offscreen = 1;
         for (int q = 0; q < npolys; q++) for (int j = 0; j < polys[q].n; j++) if (polys[q].p[j].y > OP1_Q10(150) || polys[q].p[j].y < OP1_Q10(2) || polys[q].p[j].x < OP1_Q10(2) || polys[q].p[j].x > OP1_Q10(318)) offscreen = 1;
+        escapes += dyn_escapes();
     }
     CHECK((rest - top) / 1024.0 > 5, "a note kicks the wheel off the road (%.1f px)", (rest - top) / 1024.0);
     CHECK(shadow >= 2, "and its shadow stays on the road");
     CHECK(!offscreen, "nothing goes off the screen or below its lower margin, at the largest size, flat, lowrider, bouncing");
+    host_knobs[0][1] = 32767; for (int i = 0; i < 40; i++) { frame("rough road, rolling"); escapes += dyn_escapes(); } host_knobs[0][1] = 20000;
+    CHECK(escapes == 0 && dyn_from > 0, "no moving stroke or fill reaches the still label layer (%d escapes)", escapes);
     CHECK(ang != a0, "the wheel turns while a note sounds");
     vis_lvl = 0; for (int i = 0; i < 400; i++) frame("coasting");
     a0 = ang; frame("stopped");

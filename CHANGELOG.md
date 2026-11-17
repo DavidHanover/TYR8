@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.12
+A lighter screen, the same picture.
+
+- The labels are a still layer: the firmware keeps them and redraws only the moving area, so their ~170 lines are
+  drawn only when a value, Shift or the mode changes.
+- Nothing the tyre covers is drawn: the street behind it is cut at its outline, and lug faces behind the near face
+  are skipped.
+- Circles use segments by size (10 for the hub, up to 24).
+- Together about 35-38 % fewer lines on an ordinary frame. The largest tyre is a little smaller (0.81) so that its
+  widest bulge stays clear of the label layer.
+
 ## 0.9.11
 - The road is a street: wider, with a curb, a sidewalk and grass behind it, all scrolling.
 - Knock makes the road rough instead of drawing ridges: rocks in the tyre's path, which it hops over, cracks in the
