@@ -30,6 +30,8 @@ void  host_raster_line(void *r, const void *p0, const void *p1, int32_t w_q10, c
 #define op1_raster()                      host_raster()
 #define op1_raster_line(r, p0, p1, w, c)  host_raster_line((r), (p0), (p1), (w), (c))
 
+extern int16_t  host_t2[8][8];
+static inline const volatile int16_t *op1_t2_words(int slot) { return host_t2[slot & 7]; }
 static inline int op1_current_slot(void) { return host_slot; }
 static inline const int16_t *op1_synth_knobs(int slot) { return host_knobs[slot & 7]; }
 static inline void op1_synth_knobs_live(int slot, int16_t out[4])

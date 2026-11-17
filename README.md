@@ -25,59 +25,73 @@ plugins**. Sounds saved with tyr8 keep their name and come back if you reinstall
 
 ## Controls
 
-Each encoder has a value on a plain turn, a second with **Shift** held, and blue, green and white have a third
-reached by **pushing** the encoder (push again to go back). The corner of the screen in that encoder's colour shows
-which value the knob is on and what it is set to.
+The four encoders on **T1** shape the sound, and the OP-1's own envelope page, **T2**, sets the volume envelope.
+Each T1 encoder has a value on a plain turn and a second with **Shift** held. The corner of the screen in that
+encoder's colour shows its name and setting.
 
-### Turn
+### T1
 
-| Encoder | Label | Range | What it does |
-|---|---|---|---|
-| Blue | `SHAPE` | −50 → 150 % | The oscillator's wave. 0 % is a sine, 50 % a triangle, 100 % a saw. Below 0 % and above 100 % the output is fed back into the oscillator: a little thickens it, a lot breaks it up until there is no steady pitch. |
-| Green | `KNOCK` | 0 → 100 % | How far the pitch starts above the note before dropping onto it: the kick at the front of the 808. Up to 16 times the note's frequency. |
-| White | `KNOCK LEN` | 20 ms → 1.5 s | How long that pitch drop takes. Short is a click, long is a slow dive. |
-| Orange | `DECAY` | 0.1 → 4 s | How long the note rings. It also sets the size of the tyre on screen. |
+| Encoder | Turn | Shift + turn |
+|---|---|---|
+| Blue | `SHAPE`: the wave. 0 % sine, 50 % triangle, 100 % saw; below 0 % and above 100 % the output feeds back into the oscillator, until there is no steady pitch | `DRIVE`: distortion before the clipper, up to 30 dB: fatter, then gritty. **Shift + push blue** switches this to `CLIP`, the final clipper from a rounded soft clip to a hard brick wall (squarer and brighter); push again for drive |
+| Green | `KNOCK`: how far the pitch starts above the note before dropping onto it, up to 16 times its frequency | `KNOCK LEN`: how long that drop takes, 20 ms (a click) to 1.5 s (a slow dive) |
+| White | `TONE`: a low-pass after the drive. 100 % is open; lower is darker, down to 140 Hz | `SUB`: blends a clean sine at the note in after the clipper, so it stays clean: more weight, less grit. At full it is 60 % of the output |
+| Orange | `SAG`: the pitch falls while the note lasts, by up to two octaves over the decay | `GLIDE`: how long the pitch slides between overlapping notes, 0 to 500 ms. `MONO GLIDE` only |
 
-### Shift + turn
-
-| Encoder | Label | Range | What it does |
-|---|---|---|---|
-| Blue | `DRIVE` | 0 → 100 % | Distortion before the clipper, up to 30 dB of gain: fatter, then gritty and growling. |
-| Green | `CLIP` | 0 → 100 % | The final clipper, from a rounded soft clip to a hard brick wall driven harder. Harder is squarer and brighter. It also sets the tread on the tyre, slick to off-road. |
-| White | `SUSTAIN` | 0 → 100 % | The level a held note settles at. At 0 every note is a one-shot that rings for the full decay however short the key press. |
-| Orange | `GLIDE` | 0 → 500 ms | How long the pitch takes to slide between overlapping notes. Only used in `MONO GLIDE`. |
-
-### Push, then turn
-
-| Encoder | Label | Range | What it does |
-|---|---|---|---|
-| Blue | `SUB` | 0 → 100 % | Blends a clean sine at the note under the driven sound, to keep the low end solid. |
-| Green | `TONE` | 100 → 0 % | A low-pass filter after the drive. 100 % is fully open; lower is darker. |
-| White | `ATTACK` | 0 → 100 ms | Fades the start of the note in, to sit it behind a separate kick. |
-| White (push twice) | `SAG` | 0 → 100 % | The pitch falls steadily while the note lasts, by up to two octaves over the decay. Leave it at 0 for held basslines. |
-
-### Orange push: play mode
-
-Pushing orange steps through three modes. The current one is shown under the orange label.
+**Push orange** (with or without Shift) to switch between the two play modes. The current one is shown under orange's label.
 
 | Mode | What it does |
 |---|---|
 | `MONO GLIDE` | One voice. A note played while another is held and still sounding does not restart: the pitch glides to it. Letting go glides back to the key still held. |
 | `MONO RETRIG` | One voice. Every note restarts on its own pitch with no glide. Letting go restarts the key still held. |
-| `POLY` | Up to six notes at once, each at half level. No glide. |
+
+### T2: envelope
+
+TYR8 draws its own envelope page, with the curve in the encoders' colours.
+
+| Encoder | Label | Range | What it does |
+|---|---|---|---|
+| Blue | `ATTACK` | 0 → 1 s | Fades the note in. Most of the turn is under 300 ms. |
+| Green | `DECAY` | 0.1 → 4 s | How fast the level falls from the hit to the sustain level. It also sets the size of the tyre on T1. |
+| White | `SUSTAIN` | 0 → 100 % | The level a held note settles at. |
+| Orange | `RELEASE` | 10 ms → 4 s, then `HOLD` | How fast the note dies after the key goes up. At the top of the turn, `HOLD`, the note carries on at the decay rate instead. |
+
+**For the classic 808 one-shot,** set `SUSTAIN` to 0 and `RELEASE` to `HOLD`: every note rings its full decay
+however short the key press. The T2 values are stored with the sound like any OP-1 envelope, so a sound starts with
+whatever envelope the slot had before; set those two first.
+
+### The screen
+
+A tyre rolls along an isometric road that runs the whole diagonal of the screen, between the labels. Each part
+follows a setting:
+
+| What you see | Follows |
+|---|---|
+| Size, small car tyre to monster truck | `DECAY` (T2) |
+| Tread: a smooth racing slick at 0, then staggered off-road blocks rising | `DRIVE` or `CLIP`, whichever is higher |
+| A flat: the bottom squashes onto the road and the sidewall bulges | `SAG` |
+| Rim, from a plain dish to laced lowrider wire spokes, then a whitewall with an orange pinstripe, then a gold knock-off spinner | `SUB` |
+| Spin, and the road's dashed centre line scrolling under it | the pitch, while a note sounds |
+| A bounce on every new note, and ridges on the road | `KNOCK` |
 
 ### Good to know
 
 - **Pitch:** the engine sounds two octaves below the key, so the OP-1's octave 0 is already bass.
-- **Envelope:** TYR8 shapes its own level. The OP-1's envelope page (T2) has no effect on it.
-- **Loudness:** the clipper is always last and always driven, so the output is at full scale at any setting. Drive
-  and clip add density, not peak level.
-- **Saving:** every value above, and the play mode, is saved with the sound. Which knobs are pushed is not.
+- **Loudness:** the clipper is always last for everything but the sub, and always driven, so the output is at full
+  scale at any setting. Drive and clip add density, not peak level. Turning the sub up trades some density for
+  weight: about 2 dB less loudness at full.
+- **Saving:** every value above, and the play mode, is saved with the sound. Whether Shift + blue is on drive or
+  clip is not.
+- **Tail:** once a note is dying away and has fallen below about −51 dBFS, it fades to silence over about 70 ms
+  instead of trailing off through the last few bits of the 16-bit output, which turns to grit when an effect after
+  TYR8 brings it up. Held notes at their sustain level are left alone.
 - **Lowest notes:** the OP-1 filters its synth output below about 35 Hz, so the very lowest notes lose weight.
+- **Sounds from 0.9.3** load with some values in new places: they need their envelope, tone, glide and knock length
+  set again.
 
 ## Signal path
 
-Oscillator (with feedback from the output) → amp envelope → drive → tone → sub → clipper → attack fade.
+Oscillator (with feedback from the output) → amp envelope → drive → tone → clipper → sub blended in → attack fade.
 
 ## Build from source
 
@@ -90,8 +104,8 @@ Needs gcc, python3, curl, and Docker for the plugin file. The first full build m
 from `toolchain/Dockerfile` (Blackfin GCC 13.3.0; about five minutes, once). The script downloads the Hundekraft 3.3
 source and SDK into `sdk/`, verifies its checksum, and packs with the SDK's own `tools/kennel/pack.py`.
 
-- `plugin/tyr8/` — `tyr8.c` (engine and screen), `plugin.json`, and `gen_svg.py`, which writes `tyr8.svg` and
-  `tyr8_geom.h`.
+- `plugin/tyr8/` — `tyr8.c` (engine and screen), `plugin.json`, and `gen_svg.py`, which writes the (empty)
+  `tyr8.svg`: the screen is drawn in code.
 - `test/` — checks that build the plugin for the PC and test what it promises, plus a preview renderer for the
   screen. These are stand-ins for the firmware, not an emulator.
 - `toolchain/` — the cross-compiler image.
