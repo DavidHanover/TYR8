@@ -671,6 +671,7 @@ static void *fb_scr;
 #ifdef OP1_HOST
 extern uint16_t host_frame565[400 * 256];
 void host_fill_poly(const op1_pt *p, int n, const uint8_t *rgba);
+void host_mark_dynamic(void);
 #endif
 static void fill_begin(void *scr, void *r)
 {
@@ -811,8 +812,10 @@ static int hull(op1_pt *p, int n, op1_pt *h)
 /* a ring of the near face at radius r (Q10 px), warped as the tyre is */
 static void ring(void *r, const wheel_t *w, int32_t rr, int32_t p, const uint8_t *c)
 {
+    int n = 6 + (rr >> 11);                                    /* segments by size: 10 for the hub .. 24, under 0.4 px off */
+    n = n < 10 ? 10 : (n > 24 ? 24 : n);
     op1_pt a = wp(w, 0, rr, p);
-    for (int i = 1; i <= RING_N; i++) { const op1_pt b = wp(w, 8192 * i / RING_N, rr, p); lnp(r, a, b, c); a = b; }
+    for (int i = 1; i <= n; i++) { const op1_pt b = wp(w, 8192 * i / n, rr, p); lnp(r, a, b, c); a = b; }
 }
 static void poly_line(void *r, const op1_pt *p, int n, const uint8_t *c)
 {
@@ -821,6 +824,24 @@ static void poly_line(void *r, const op1_pt *p, int n, const uint8_t *c)
 
 /* the visible faces of lug i (back to front by the caller): its top, the side that faces the viewer, and for a far-row
  * block its near end. Each filled black, then outlined */
+/* inside any polygon (even-odd) */
+static int in_poly(const op1_pt *p, int n, op1_pt q)
+{
+    int in = 0;
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        if ((p[i].y > q.y) == (p[j].y > q.y)) continue;
+        const int32_t xc = p[i].x + (int32_t)(((int64_t)(q.y - p[i].y) * (p[j].x - p[i].x)) / (p[j].y - p[i].y));
+        if (q.x < xc) in = !in;
+    }
+    return in;
+}
+static const op1_pt *near_face;               /* the near face's outline: lug faces wholly inside it are covered */
+static int near_n;
+static int covered(const op1_pt *q)
+{
+    for (int i = 0; i < 4; i++) if (!in_poly(near_face, near_n, q[i])) return 0;
+    return 1;
+}
 static void lug(void *r, const wheel_t *w, int32_t a0, int i)
 {
     const int32_t pitch = 8192 / LUG_N, hw = pitch * 9 / 20, hwt = pitch * 7 / 20;
@@ -832,16 +853,19 @@ static void lug(void *r, const wheel_t *w, int32_t a0, int i)
     /* side at ea: normal (sin, -cos) of ea; at eb: (-sin, cos) */
     const int32_t va = -24550 * (tsin(ea) >> 4) - 21955 * (tcos(ea) >> 4), vb = 24550 * (tsin(eb) >> 4) + 21955 * (tcos(eb) >> 4);
     if (w->rt > w->rc + 256) {
-        if (va > 0) { q[0] = wp(w, ea, w->rc, p0); q[1] = wp(w, ta, w->rt, p0); q[2] = wp(w, ta, w->rt, p1); q[3] = wp(w, ea, w->rc, p1); fill_poly(q, 4, COL_DIM); }
-        if (va > 0) poly_line(r, q, 4, COL_BUMP);
-        if (vb > 0) { q[0] = wp(w, eb, w->rc, p0); q[1] = wp(w, tb, w->rt, p0); q[2] = wp(w, tb, w->rt, p1); q[3] = wp(w, eb, w->rc, p1); fill_poly(q, 4, COL_DIM); poly_line(r, q, 4, COL_BUMP); }
+        if (va > 0) { q[0] = wp(w, ea, w->rc, p0); q[1] = wp(w, ta, w->rt, p0); q[2] = wp(w, ta, w->rt, p1); q[3] = wp(w, ea, w->rc, p1);
+                      if (!covered(q)) { fill_poly(q, 4, COL_DIM); poly_line(r, q, 4, COL_BUMP); } }
+        if (vb > 0) { q[0] = wp(w, eb, w->rc, p0); q[1] = wp(w, tb, w->rt, p0); q[2] = wp(w, tb, w->rt, p1); q[3] = wp(w, eb, w->rc, p1);
+                      if (!covered(q)) { fill_poly(q, 4, COL_DIM); poly_line(r, q, 4, COL_BUMP); } }
         if (i & 1) { q[0] = wp(w, ea, w->rc, p0); q[1] = wp(w, ta, w->rt, p0); q[2] = wp(w, tb, w->rt, p0); q[3] = wp(w, eb, w->rc, p0);
-                     fill_poly(q, 4, COL_DIM); poly_line(r, q, 4, COL_BUMP); }
+                     if (!covered(q)) { fill_poly(q, 4, COL_DIM); poly_line(r, q, 4, COL_BUMP); } }
     }
     if (vt > 0) {
         q[0] = wp(w, ta, w->rt, p0); q[1] = wp(w, tb, w->rt, p0); q[2] = wp(w, tb, w->rt, p1); q[3] = wp(w, ta, w->rt, p1);
-        fill_poly(q, 4, (const uint8_t[4]){ 0, 0, 0, 0xFF });
-        poly_line(r, q, 4, COL_WHITE);
+        if (!covered(q)) {
+            fill_poly(q, 4, (const uint8_t[4]){ 0, 0, 0, 0xFF });
+            poly_line(r, q, 4, COL_WHITE);
+        }
     }
 }
 
@@ -860,8 +884,9 @@ static inline op1_pt gp(int32_t s, int32_t p)
 
 /* ---- road lines: clipped to the screen and cut around the four label blocks, so the road can run the whole
  * diagonal and fill the space between them ---- */
-static const int16_t KEEP_OUT[4][4] = {        /* x0, y0, x1, y1 px: the label blocks and a margin (orange's has the mode) */
-    { 4, 4, 106, 24 }, { 214, 4, 316, 24 }, { 4, 102, 106, 124 }, { 214, 102, 316, 134 } };
+static const int16_t KEEP_OUT[4][4] = {        /* x0, y0, x1, y1 px: the label blocks (orange's has the mode), and 3 px more
+                                                * toward the scene, so that no moving stroke reaches the still label layer */
+    { 0, 0, 108, 24 }, { 214, 0, 320, 24 }, { 0, 101, 108, 123 }, { 214, 101, 320, 136 } };
 #define ROAD_SEG_MAX 1024
 static op1_pt road_seg[ROAD_SEG_MAX][2];      /* for the tests: the road's pieces as last drawn */
 static int    road_nseg;
@@ -885,9 +910,45 @@ static op1_pt lerp(op1_pt a, op1_pt b, int32_t t)
     op1_pt o = { a.x + (int32_t)(((int64_t)(b.x - a.x) * t) >> 16), a.y + (int32_t)(((int64_t)(b.y - a.y) * t) >> 16) };
     return o;
 }
+/* ---- hidden lines: what the tyre will cover is not drawn at all ---- */
+static const op1_pt *cull;                    /* the tyre's silhouette (convex) while the street behind it is drawn */
+static int cull_n, cull_sg;
+/* inside a convex polygon whose winding sign is sg */
+static int in_hull(const op1_pt *h, int n, int sg, op1_pt q)
+{
+    for (int i = 0, j = n - 1; i < n; j = i++)
+        if (((int64_t)(h[i].x - h[j].x) * (q.y - h[j].y) - (int64_t)(h[i].y - h[j].y) * (q.x - h[j].x)) * sg < 0) return 0;
+    return 1;
+}
+/* the part [t0, t1] (Q16) of a -> b inside the convex polygon (Cyrus-Beck) */
+static int hull_in(op1_pt a, op1_pt b, const op1_pt *h, int n, int sg, int32_t *t0, int32_t *t1)
+{
+    int64_t lo = 0, hi = 65536;
+    const int32_t dx = b.x - a.x, dy = b.y - a.y;
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        const int64_t ex = h[i].x - h[j].x, ey = h[i].y - h[j].y;
+        const int64_t A = (ex * (a.y - h[j].y) - ey * (a.x - h[j].x)) * sg, B = (ex * dy - ey * dx) * sg;
+        if (B == 0) { if (A < 0) return 0; continue; }
+        const int64_t t = (-A * 65536) / B;
+        if (B > 0) { if (t > lo) lo = t; } else if (t < hi) hi = t;
+        if (lo >= hi) return 0;
+    }
+    *t0 = (int32_t)lo; *t1 = (int32_t)hi;
+    return 1;
+}
 static void road_cut(void *r, op1_pt a, op1_pt b, const uint8_t *c, int k)
 {
     if (k == 4) {
+        if (a.x == b.x && a.y == b.y) return;
+        int32_t t0, t1;
+        if (cull && hull_in(a, b, cull, cull_n, cull_sg, &t0, &t1)) {   /* behind the tyre: only what sticks out */
+            if (t0 > 256) road_cut(r, a, lerp(a, b, t0), c, 5);
+            if (t1 < 65536 - 256) road_cut(r, lerp(a, b, t1), b, c, 5);
+            return;
+        }
+        k = 5;
+    }
+    if (k == 5) {
         if (a.x == b.x && a.y == b.y) return;
         if (road_nseg < ROAD_SEG_MAX) { road_seg[road_nseg][0] = a; road_seg[road_nseg][1] = b; road_nseg++; }
         lnp(r, a, b, c);
@@ -939,6 +1000,11 @@ static void rock(void *r, int32_t s, int32_t p, int32_t rr, int32_t h)
         if (hl[i].x < OP1_Q10(4) || hl[i].x > OP1_Q10(316) || hl[i].y < OP1_Q10(4) || hl[i].y > OP1_Q10(149)) return;
         for (int k = 0; k < 4; k++)
             if (hl[i].x > OP1_Q10(KEEP_OUT[k][0]) && hl[i].x < OP1_Q10(KEEP_OUT[k][2]) && hl[i].y > OP1_Q10(KEEP_OUT[k][1]) && hl[i].y < OP1_Q10(KEEP_OUT[k][3])) return;
+    }
+    if (cull) {                                                /* wholly behind the tyre: nothing to draw */
+        int hid = 1;
+        for (int i = 0; i < n && hid; i++) hid = in_hull(cull, cull_n, cull_sg, hl[i]);
+        if (hid) return;
     }
     static const uint8_t BLK[4] = { 0, 0, 0, 0xFF };
     fill_poly(hl, n, BLK);
@@ -1042,14 +1108,27 @@ static void draw_road(void *r, int32_t amt, int32_t shadow_w, int front, int32_t
     }
 }
 
-static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
+/* the wheel's outlines and silhouette for this frame, before anything is drawn: the street behind it is culled by it */
+static op1_pt nf[LUG_N / 2 * 5], ff[LUG_N / 2 * 5];
+static int nn, fn;
+static void wheel_prep(const wheel_t *w, int32_t sp)
 {
-    const int32_t a0 = -sp;                                    /* rolling up the road turns it clockwise */
-    op1_pt nf[LUG_N / 2 * 5], ff[LUG_N / 2 * 5], all[LUG_N * 5];
-    const int nn = outline(w, a0, 0, nf), fn = outline(w, a0, 1, ff);
+    const int32_t a0 = -sp;
+    op1_pt all[LUG_N * 5];
+    nn = outline(w, a0, 0, nf); fn = outline(w, a0, 1, ff);
     for (int i = 0; i < nn; i++) all[i] = nf[i];
     for (int i = 0; i < fn; i++) all[nn + i] = ff[i];
     sil_n = hull(all, nn + fn, sil);
+    int64_t area = 0;
+    for (int i = 0, j = sil_n - 1; i < sil_n; j = i++) area += (int64_t)sil[j].x * sil[i].y - (int64_t)sil[i].x * sil[j].y;
+    cull_sg = area > 0 ? 1 : -1;
+    cull_n = sil_n;
+    near_face = nf; near_n = nn;
+}
+
+static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
+{
+    const int32_t a0 = -sp;                                    /* rolling up the road turns it clockwise */
     static const uint8_t BLACK[4] = { 0, 0, 0, 0xFF };
     fill_poly(sil, sil_n, BLACK);                              /* the whole tyre hides the road behind it */
     far_edge(r, w, a0);                                        /* the far rim, where it shows */
@@ -1163,7 +1242,7 @@ static void ty_screen_update(void *scr, int dt)
     int32_t env[4];
     t2_get(slot, env);
     wheel_t wh;
-    wh.s = 563 + ((317 * env[T2_DECAY]) >> 15);                             /* 0.55 .. 0.86, Q10 */
+    wh.s = 563 + ((266 * env[T2_DECAY]) >> 15);                             /* 0.55 .. 0.81, Q10 */
     const int32_t kt = (tread * 1024) >> 15;                                 /* lug height 0 .. 1, Q10; 0: a slick */
     wh.rc = wh.s * R_C;
     wh.rt = wh.rc + wh.s * LUG_H * kt / 1024;
@@ -1210,13 +1289,7 @@ static void ty_screen_update(void *scr, int dt)
     vis_hub_y = wh.hy;
     last_wheel = wh;
 
-    op1_screen_draw(scr, dt);
-    void *r = op1_raster();
-    fill_begin(scr, r);
-    draw_road(r, amt, by < -OP1_Q10(2) ? wh.wd : 0, 0, wh.wd);
-    wheel(r, &wh, (int32_t)(ang >> 8), rc[REC_SUB]);
-    draw_road(r, amt, 0, 1, wh.wd);
-
+    /* the labels: what they say this frame */
     /* the four encoders, each in its colour: name, gauge, value. While Shift is held, the four Shift values */
     const int shift = op1_shift_held() != 0;
     const char *name[4];
@@ -1243,11 +1316,47 @@ static void ty_screen_update(void *scr, int dt)
         num[2] = (val[2] * 100 + 16384) >> 15;                               /* tone: how open */
         num[3] = (val[3] * 100 + 16384) >> 15;                               /* sag, % */
     }
-    labels(r, name, val, num, unit);
-    /* the play mode, under orange's block and in its colour: its push steps it */
     static const char *const modes[MODE_N] = { "MONO GLIDE", "MONO RETRIG" };
     const char *const mt = modes[mode_of(slot)];
-    sq_text(r, OP1_Q10(312) - sq_width(LBL_S, mt) + OP1_Q10(2), OP1_Q10(123), LBL_S, mt, 1024, COL_KNOB[3]);
+
+    /* The labels are a still layer: the core keeps it and each frame restores only the moving areas (the whole screen
+     * outside the label blocks, which the street and the tyre never enter), so they are drawn again only when what
+     * they say changes. Without the core's region support op1_screen_static is always 1 and everything is drawn */
+    /* the still label areas are the label text and gauges and 1 px: 0..105 x 0..21 and 104..120 on the left, 217..319 x
+     * 0..21 and 104..133 (with the mode) on the right; the moving area is the rest. KEEP_OUT is 3 px bigger */
+    static const op1_rect_t DYN[5] = { { 106, 0, 216, 159 }, { 0, 22, 105, 103 }, { 0, 121, 105, 159 },
+                                       { 217, 22, 319, 103 }, { 217, 134, 319, 159 } };
+    uint32_t lh = 2166136261u;
+    for (int i = 0; i < 4; i++) {
+        lh = (lh ^ (uint32_t)(uintptr_t)name[i]) * 16777619u;
+        lh = (lh ^ (uint32_t)num[i]) * 16777619u;
+        lh = (lh ^ (uint32_t)(val[i] >> 5)) * 16777619u;     /* the gauge moves in steps of 32 */
+        lh = (lh ^ (uint32_t)unit[i]) * 16777619u;
+    }
+    lh = (lh ^ (uint32_t)(uintptr_t)mt) * 16777619u;
+    static uint32_t last_lh;
+    if (lh != last_lh) { last_lh = lh; op1_screen_static_dirty(scr); }
+    op1_screen_regions(scr, DYN, 5);
+    void *r = op1_raster();
+    if (op1_screen_static(scr)) {
+        op1_screen_draw(scr, dt);
+        labels(r, name, val, num, unit);
+        /* the play mode, under orange's block and in its colour: its push steps it */
+        sq_text(r, OP1_Q10(312) - sq_width(LBL_S, mt) + OP1_Q10(2), OP1_Q10(123), LBL_S, mt, 1024, COL_KNOB[3]);
+        op1_screen_static_done(scr);
+    }
+
+    /* the moving parts, only inside DYN */
+#ifdef OP1_HOST
+    host_mark_dynamic();
+#endif
+    fill_begin(scr, r);
+    wheel_prep(&wh, (int32_t)(ang >> 8));
+    cull = sil;                                                /* the street behind the tyre: what it covers is skipped */
+    draw_road(r, amt, by < -OP1_Q10(2) ? wh.wd : 0, 0, wh.wd);
+    cull = 0;
+    wheel(r, &wh, (int32_t)(ang >> 8), rc[REC_SUB]);
+    draw_road(r, amt, 0, 1, wh.wd);                            /* in front of it: not culled */
 }
 
 const op1_screen_t SCREEN_tyr8 = { ty_screen_init, ty_screen_update };

@@ -22,10 +22,10 @@ grows treads with the sound.
 
 | Thing | State |
 |---|---|
-| Source | Branch `tyr8-0.9.9`: 0.9.9 and 0.9.11 committed on top of `e6a25ca` (0.9.3, pushed). Not pushed or merged. |
+| Source | Branch `tyr8-0.9.12` (pushed): 0.9.9, 0.9.11 and 0.9.12 on top of `e6a25ca` (0.9.3). `main` is still at 0.9.3. |
 | Not tried on hardware | Most of 0.9.4 to 0.9.9: the T2 page, the Shift-turn takeover, the code-drawn screen (pixel fills), the tail fade. The owner tests by ear on their OP-1. |
-| Host checks | 142 pass (`./build.sh test`). |
-| Plugin file | `build/tyr8.knl`, 40,556 bytes, version 0.9.11, built with Blackfin GCC 13.3.0. Not committed (`build/` is ignored). |
+| Host checks | 143 pass (`./build.sh test`). |
+| Plugin file | `build/tyr8.knl`, 44,068 bytes, version 0.9.12, built with Blackfin GCC 13.3.0. Not committed (`build/` is ignored). |
 | GitHub release | **Not created.** The README links to the releases page, which is empty. The owner was going to make a release with `tyr8.knl` attached (planned as `v0.9.3`; the code is now 0.9.9). There is no `gh` CLI on this machine. |
 | Reddit post | Drafted in `build/reddit_post.md` (ignored). Has two placeholders: the demo clip and a "Tested on" line. |
 | Demo video | `build/tyr8_demo.mp4` (302 MB) and `build/tyr8_demo_reddit.mp4` (48 MB). See section 12. |
@@ -340,7 +340,15 @@ the raster's pixels** (`fill_poly`, even-odd scanline, RGB565, the layout dx_gfx
   edge. The grass is most of the line count: thin it (`GRASS_ROWS`, the density test) if the screen gets slow.
 - **Layout limits:** the largest, flattest tyre stays clear of the label blocks and above y = 150; the tests check
   the real silhouette, and every road line, against the label text.
-- **Cost:** 600 to 850 raster lines a frame (since the street, 0.9.11) plus about 40 fills, on the GUI thread. If the OP-1's screen gets slow,
+- **Still labels (0.9.12):** `op1_screen_regions` declares the moving area (`DYN`, the screen outside the label
+  text and gauges plus 1 px); the labels and the mode are drawn only in the `op1_screen_static` pass, and
+  `op1_screen_static_dirty` is called when a hash of what they say changes. Nothing that moves may reach the still
+  layer, or it would never be erased there: the street is cut at `KEEP_OUT` (the still area plus 3 px, out to the
+  screen edges) and the largest tyre is sized to stay inside; the test `dyn_escapes` checks every moving stroke
+  (with its width) and fill. **Untested on hardware;** if labels flicker or leave trails, drop the region calls.
+- **Hidden lines (0.9.12):** `wheel_prep` builds the silhouette first; road lines behind it are clipped to what
+  sticks out (`hull_in`, Cyrus-Beck), rocks wholly behind it and lug faces inside the near face are skipped.
+- **Cost:** 335 to 560 raster lines on an ordinary frame (0.9.12; was 535 to 850), plus about 40 fills, on the GUI thread. If the OP-1's screen gets slow,
   thin the rings (`RING_N`) or the spokes first.
 
 ---
