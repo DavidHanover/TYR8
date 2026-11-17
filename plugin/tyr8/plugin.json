@@ -1,0 +1,16 @@
+{
+  "name": "tyr8",
+  "kind": "synth",
+  "order": 0,
+  "loadable": true,
+  "symbol": "ENGINE_tyr8",
+  "sources": ["tyr8.c"],
+  "defaults": [8192, 12000, 4500, 16000],
+  "page2_defaults": [14000, 12000, 0],
+  "own_envelope": true,
+  "engine_input": true,
+  "screen": { "svg": "tyr8.svg", "symbol": "SCREEN_tyr8" },
+  "claims": [],
+  "author": "David Hanover",
+  "version": "0.9.3"
+}
