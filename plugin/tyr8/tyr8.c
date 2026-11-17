@@ -595,9 +595,11 @@ const op1_engine_ext2_t ENGINE_tyr8 = {
  *   spokes   sub (Shift + white): a plain dish with five nuts .. laced lowrider wire spokes (up to 40), then a
  *            whitewall with an orange pinstripe (from half way), then a gold knock-off spinner (from 80 %)
  *   spin     the sounding pitch, while a note sounds; it coasts down after, and the road scrolls under it
- *   road     a band along the whole diagonal, its lines cut around the label blocks; a dashed centre line scrolls
+ *   street   a road along the whole diagonal (a dashed centre line), a curb, a sidewalk and grass behind it, all
+ *            scrolling, their lines cut around the label blocks
  *   bounce   every restarted note kicks the wheel off the road, harder with the pitch envelope amount (green), and
- *            its shadow stays on the road; the road grows ridges with the amount too, and the wheel hops over them
+ *            its shadow stays on the road. The amount also makes the road rough: rocks in the wheel's track, which it
+ *            hops over, cracks in the pavement, and from 40 % weeds in the cracks
  *   labels   one block a corner, each encoder in its colour (blue and green on top, white and orange below): name,
  *            value and a gauge; while Shift is held the Shift set, blue's drive or clip as switched. The play mode is
  *            under orange's block */
@@ -618,7 +620,15 @@ const op1_engine_ext2_t ENGINE_tyr8 = {
 #define LUG_N     16                          /* blocks around; the near face shows every other one */
 #define ROAD_LEN  300                         /* the road along travel, each way from the contact point, px (clipped) */
 #define ROAD_P0   (-22)                       /* and across, in depth: in front of the wheel .. behind it */
-#define ROAD_P1   74
+#define ROAD_P1   90                          /* the gutter: the curb starts here */
+#define KERB_H    3                           /* the curb and the sidewalk, px up */
+#define WALK_W    24                          /* the sidewalk, deep */
+#define SLAB_PX   18                          /* its joints */
+#define GRASS_S   10                          /* the grass grid: along travel, across */
+#define GRASS_P   9
+#define GRASS_ROWS 8
+#define GRASS_COLS 22
+#define CRACK_PX  15                          /* where cracks can be */
 #define TICK_PX   12                          /* where ridges can be */
 #define DASH_PX   8                           /* the centre line's dashes */
 #define RING_N    28                          /* segments of a drawn ring */
@@ -764,6 +774,25 @@ static int outline(const wheel_t *w, int32_t a0, int far, op1_pt *o)
     return n;
 }
 
+/* the far face's rim, only where it shows: where the tread next to it faces the viewer (the upper left). The rest of
+ * it is behind the tread and the near face */
+static void far_edge(void *r, const wheel_t *w, int32_t a0)
+{
+    const int32_t pitch = 8192 / LUG_N, hw = pitch * 9 / 20, hwt = pitch * 7 / 20;
+    for (int i = 1; i < LUG_N; i += 2) {
+        const int32_t c = a0 + i * pitch;
+        const int32_t an[6] = { c - hw, c - hwt, c + hwt, c + hw, c + pitch, c + pitch + (pitch - hw) };
+        const int32_t rr[6] = { w->rc, w->rt, w->rt, w->rc, w->rc, w->rc };
+        op1_pt q0 = wp(w, an[0], rr[0], w->wd);
+        for (int k = 1; k < 6; k++) {
+            const op1_pt q1 = wp(w, an[k], rr[k], w->wd);
+            const int32_t m = (an[k - 1] + an[k]) / 2;
+            if (-24550 * (tcos(m) >> 4) + 21955 * (tsin(m) >> 4) > 0) lnp(r, q0, q1, COL_BUMP);
+            q0 = q1;
+        }
+    }
+}
+
 static int64_t cross(op1_pt o, op1_pt a, op1_pt b) { return (int64_t)(a.x - o.x) * (b.y - o.y) - (int64_t)(a.y - o.y) * (b.x - o.x); }
 /* convex hull (monotone chain) of n points, in place order lost; -> hull in h, its size */
 static int hull(op1_pt *p, int n, op1_pt *h)
@@ -833,7 +862,7 @@ static inline op1_pt gp(int32_t s, int32_t p)
  * diagonal and fill the space between them ---- */
 static const int16_t KEEP_OUT[4][4] = {        /* x0, y0, x1, y1 px: the label blocks and a margin (orange's has the mode) */
     { 4, 4, 106, 24 }, { 214, 4, 316, 24 }, { 4, 102, 106, 124 }, { 214, 102, 316, 134 } };
-#define ROAD_SEG_MAX 96
+#define ROAD_SEG_MAX 1024
 static op1_pt road_seg[ROAD_SEG_MAX][2];      /* for the tests: the road's pieces as last drawn */
 static int    road_nseg;
 /* the part [t0, t1] (Q16) of a -> b inside the box, if any (Liang-Barsky) */
@@ -879,39 +908,135 @@ static void road_line(void *r, op1_pt a, op1_pt b, const uint8_t *c)
     road_cut(r, lerp(a, b, t0), lerp(a, b, t1), c, 0);
 }
 
-/* the road: a band along travel, ROAD_P0 (in front of the wheel) .. ROAD_P1 (behind) deep, as long as the screen.
- * The part behind the wheel's near face (depth >= 0) is drawn before the wheel, the part in front after it */
-static void draw_road(void *r, int32_t amt, int32_t shadow_w, int front)
+/* ---- the street: road, curb, sidewalk, grass, and the knock's rocks, cracks and weeds ----
+ * All of it is laid out in road coordinates (s along travel, p across, from the wheel's near face back) and scrolls
+ * with the wheel; every pattern is a hash of a cell's index, so it is the same each time it comes round. Everything
+ * at or behind the near face is drawn before the wheel (the wheel hides it), the front edge after. */
+static inline uint32_t hsh(uint32_t i, uint32_t salt) { i = (i ^ salt) * 2654435761u; i ^= i >> 15; return i * 2246822519u; }
+static inline op1_pt gph(int32_t s, int32_t p, int32_t h) { op1_pt o = gp(s, p); o.y -= h; return o; }
+static const uint8_t COL_KERB[4]  = { 0xA0, 0xA2, 0xA6, 0xFF };
+static const uint8_t COL_GRASS[4] = { 0x3A, 0x9A, 0x4A, 0xFF };
+static const uint8_t COL_WEED[4]  = { 0x8C, 0xE6, 0x4E, 0xFF };
+static int vis_rocks, vis_cracks, vis_weeds, vis_tufts;   /* for the tests */
+
+/* a tuft at ground point g: three blades, h high (Q10 px), leaning by the hash */
+static void tuft(void *r, op1_pt g, int32_t h, uint32_t k, const uint8_t *c)
+{
+    for (int b = -1; b <= 1; b++) {
+        const int32_t lean = (int32_t)((k >> (4 + 3 * (b + 1))) & 7) * 256 - 896 + b * 1200;
+        const int32_t hb = h - (b ? h / 4 : 0);
+        op1_pt a = { g.x + b * 900, g.y }, t = { g.x + b * 900 + lean, g.y - hb };
+        road_line(r, a, t, c);
+    }
+}
+/* a rock at (s, p), r across and h high (Q10 px): the hull of its footprint and its top, filled, outlined */
+static void rock(void *r, int32_t s, int32_t p, int32_t rr, int32_t h)
+{
+    op1_pt q[7] = { gp(s - rr, p), gp(s, p - rr), gp(s + rr, p), gp(s, p + rr),
+                    gph(s - rr / 2, p, h * 3 / 4), gph(s + rr / 3, p - rr / 3, h), gph(s, p + rr / 2, h * 4 / 5) }, hl[16];
+    const int n = hull(q, 7, hl);
+    for (int i = 0; i < n; i++) {                              /* not over a label, not off the screen */
+        if (hl[i].x < OP1_Q10(4) || hl[i].x > OP1_Q10(316) || hl[i].y < OP1_Q10(4) || hl[i].y > OP1_Q10(149)) return;
+        for (int k = 0; k < 4; k++)
+            if (hl[i].x > OP1_Q10(KEEP_OUT[k][0]) && hl[i].x < OP1_Q10(KEEP_OUT[k][2]) && hl[i].y > OP1_Q10(KEEP_OUT[k][1]) && hl[i].y < OP1_Q10(KEEP_OUT[k][3])) return;
+    }
+    static const uint8_t BLK[4] = { 0, 0, 0, 0xFF };
+    fill_poly(hl, n, BLK);
+    for (int i = 0; i < n; i++) road_line(r, hl[i], hl[(i + 1) % n], COL_BUMP);
+    vis_rocks++;
+}
+
+static void draw_road(void *r, int32_t amt, int32_t shadow_w, int front, int32_t track)
 {
     const int32_t s0 = -OP1_Q10(ROAD_LEN), s1 = OP1_Q10(ROAD_LEN), p0 = OP1_Q10(ROAD_P0), p1 = OP1_Q10(ROAD_P1);
-    if (front) {
-        road_line(r, gp(s0, p0), gp(s1, p0), COL_GREY);        /* front edge */
-    } else {
-        road_nseg = 0;
-        road_line(r, gp(s0, p1), gp(s1, p1), COL_GREY);        /* back edge */
-        /* the centre line, dashed, scrolling back as the wheel rolls on */
-        const int32_t pm = (p0 + p1) / 2, dash = OP1_Q10(DASH_PX);
-        const int32_t off = (int32_t)(scroll % (uint32_t)(2 * dash));
-        for (int32_t d = s0 - off; d < s1; d += 2 * dash) road_line(r, gp(d, pm), gp(d + dash, pm), COL_DIM);
+    if (front) { road_line(r, gp(s0, p0), gp(s1, p0), COL_GREY); return; }   /* the front edge, over the wheel */
+    road_nseg = 0;
+    vis_rocks = vis_cracks = vis_weeds = vis_tufts = 0;
+
+    /* curb: the gutter at road level, the curb's front and back edges KERB_H up; the sidewalk behind it, with joints */
+    const int32_t kh = OP1_Q10(KERB_H), pk = p1 + OP1_Q10(4), pw = pk + OP1_Q10(WALK_W);
+    road_line(r, gp(s0, p1), gp(s1, p1), COL_GREY);
+    road_line(r, gph(s0, p1, kh), gph(s1, p1, kh), COL_KERB);
+    road_line(r, gph(s0, pk, kh), gph(s1, pk, kh), COL_DIM);
+    road_line(r, gph(s0, pw, kh), gph(s1, pw, kh), COL_GREY);
+    const int32_t slab = OP1_Q10(SLAB_PX), soff = (int32_t)(scroll % (uint32_t)slab);
+    for (int32_t d = s0 - soff; d < s1; d += slab) {
+        road_line(r, gph(d, p1, kh), gp(d, p1), COL_DIM);      /* the curb's joints down its face */
+        road_line(r, gph(d, pk, kh), gph(d, pw, kh), COL_DIM);
     }
-    /* ridges across the road with the knock amount, at a fixed pattern of places that scrolls */
-    const int32_t tick = OP1_Q10(TICK_PX);
-    const uint32_t first = scroll / (uint32_t)tick;
-    const int32_t frac = (int32_t)(scroll % (uint32_t)tick);
-    const int32_t e = OP1_Q10(3);
-    for (int j = -ROAD_LEN / TICK_PX; j <= ROAD_LEN / TICK_PX; j++) {
-        const int32_t s = j * tick - frac;
-        const int32_t h = OP1_Q10(1) * bump(first + (uint32_t)(j + 4), amt);
-        if (!h) continue;
-        op1_pt c0 = gp(s, 0), c1 = gp(s, front ? p0 : p1);   /* the crest, from the near face's line to the edge */
-        c0.y -= h; c1.y -= h;
-        road_line(r, c0, c1, COL_BUMP);
-        if (front) {                                           /* its front end: a little gable */
-            op1_pt a = gp(s - e, p0), b = gp(s + e, p0);
-            road_line(r, a, c1, COL_BUMP); road_line(r, c1, b, COL_BUMP);
+
+    /* the centre line, dashed, scrolling back as the wheel rolls on */
+    const int32_t pm = (p0 + p1) / 2, dash = OP1_Q10(DASH_PX);
+    const int32_t off = (int32_t)(scroll % (uint32_t)(2 * dash));
+    for (int32_t d = s0 - off; d < s1; d += 2 * dash) road_line(r, gp(d, pm), gp(d + dash, pm), COL_DIM);
+
+    /* grass beyond the sidewalk: a tuft in some cells of a grid, at a jittered place in the cell */
+    {
+        const int32_t cs = OP1_Q10(GRASS_S), cp = OP1_Q10(GRASS_P);
+        const uint32_t first = scroll / (uint32_t)cs;
+        const int32_t frac = (int32_t)(scroll % (uint32_t)cs);
+        for (int row = 0; row < GRASS_ROWS; row++)
+            for (int j = -GRASS_COLS; j <= GRASS_COLS; j++) {
+                const uint32_t k = hsh(first + (uint32_t)j, 0x51ed + (uint32_t)row * 977u);
+                if ((k & 255) > 72) continue;
+                const int32_t s = j * cs - frac + (int32_t)((k >> 8) & 1023) * cs / 1024;
+                const int32_t p = pw + OP1_Q10(3) + row * cp + (int32_t)((k >> 18) & 1023) * cp / 1024;
+                tuft(r, gph(s, p, kh), OP1_Q10(3) + (int32_t)((k >> 28) & 3) * 512, k, COL_GRASS);
+                vis_tufts++;
+            }
+    }
+
+    /* the knock's bumpiness. Cracks across the pavement, more of them with the amount; weeds in them from 40 % */
+    {
+        const int32_t cs = OP1_Q10(CRACK_PX);
+        const uint32_t first = scroll / (uint32_t)cs;
+        const int32_t frac = (int32_t)(scroll % (uint32_t)cs);
+        const uint32_t many = (uint32_t)amt >> 7;              /* 0 .. 255: how many cells have one */
+        for (int j = -ROAD_LEN / CRACK_PX; j <= ROAD_LEN / CRACK_PX; j++) {
+            const uint32_t k = hsh(first + (uint32_t)j, 0xc4ac);
+            if ((k & 255) >= many * 4 / 5) continue;
+            int32_t s = j * cs - frac + (int32_t)((k >> 8) & 255) * cs / 512;
+            int32_t p = p0 + OP1_Q10(6) + (int32_t)(((k >> 16) & 1023) * (uint32_t)(p1 - p0 - OP1_Q10(30)) >> 10);
+            op1_pt a = gp(s, p), mid = a;
+            const int segs = 3 + (int)((amt * 3) >> 15);       /* longer with the amount: 3 .. 5 pieces */
+            for (int seg = 0; seg < segs; seg++) {             /* a zigzag across the road */
+                s += (int32_t)((k >> (seg * 3)) & 7) * 640 - 2240;
+                p += OP1_Q10(5) + (int32_t)((k >> (12 + seg * 2)) & 3) * 1024;
+                const op1_pt b = gp(s, p);
+                road_line(r, a, b, COL_GREY);
+                if (seg == 1) {                                /* and a branch off it */
+                    mid = b;
+                    road_line(r, b, gp(s + ((k >> 27) & 1 ? OP1_Q10(5) : -OP1_Q10(5)), p + OP1_Q10(3)), COL_GREY);
+                }
+                a = b;
+            }
+            vis_cracks++;
+            if (amt > 13107 && (k >> 30)) {
+                tuft(r, mid, OP1_Q10(2) + (int32_t)(((int64_t)(amt - 13107) * 3072) / 19660), k * 7u, COL_WEED);   /* 2 .. 5 px */
+                vis_weeds++;
+            }
         }
     }
-    if (shadow_w > 0 && !front) {                              /* the wheel off the road: its shadow where it was */
+    /* rocks in the wheel's track, where it hops (bump), bigger with the amount; a few pebbles elsewhere on the road */
+    {
+        const int32_t tick = OP1_Q10(TICK_PX);
+        const uint32_t first = scroll / (uint32_t)tick;
+        const int32_t frac = (int32_t)(scroll % (uint32_t)tick);
+        for (int j = -ROAD_LEN / TICK_PX; j <= ROAD_LEN / TICK_PX; j++) {
+            const int32_t s = j * tick - frac;
+            const uint32_t id = first + (uint32_t)(j + 4);
+            const int32_t h = bump(id, amt);
+            if (h) {
+                const uint32_t k = hsh(id, 0x70c4);
+                rock(r, s, track / 4 + (int32_t)(((k & 1023) * (uint32_t)(track / 2)) >> 10), OP1_Q10(2) + h * 512, h * 1024);
+            } else if (amt > 6554 && (hsh(id, 0xbeb1) & 255) < (uint32_t)amt >> 9) {
+                const uint32_t k = hsh(id, 0x9eb1);
+                const int32_t p = track + OP1_Q10(6) + (int32_t)(((k & 1023) * (uint32_t)(p1 - track - OP1_Q10(12))) >> 10);
+                rock(r, s, p, OP1_Q10(1) + 512, 1536);
+            }
+        }
+    }
+    if (shadow_w > 0) {                                        /* the wheel off the road: its shadow where it was */
         road_line(r, gp(-OP1_Q10(6), 0), gp(-OP1_Q10(6), shadow_w), COL_GREY);
         road_line(r, gp(OP1_Q10(6), 0), gp(OP1_Q10(6), shadow_w), COL_GREY);
     }
@@ -927,7 +1052,7 @@ static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
     sil_n = hull(all, nn + fn, sil);
     static const uint8_t BLACK[4] = { 0, 0, 0, 0xFF };
     fill_poly(sil, sil_n, BLACK);                              /* the whole tyre hides the road behind it */
-    poly_line(r, ff, fn, COL_BUMP);                            /* the far face (the near face covers most of it) */
+    far_edge(r, w, a0);                                        /* the far rim, where it shows */
     if (w->rt <= w->rc) poly_line(r, sil, sil_n, COL_BUMP);   /* a slick: its outline, with the edges across the tread */
 
     /* the lugs, back to front: by depth along the view, (-0.749 cos + 0.67 sin) r minus the block's mid depth */
@@ -1088,9 +1213,9 @@ static void ty_screen_update(void *scr, int dt)
     op1_screen_draw(scr, dt);
     void *r = op1_raster();
     fill_begin(scr, r);
-    draw_road(r, amt, by < -OP1_Q10(2) ? wh.wd : 0, 0);
+    draw_road(r, amt, by < -OP1_Q10(2) ? wh.wd : 0, 0, wh.wd);
     wheel(r, &wh, (int32_t)(ang >> 8), rc[REC_SUB]);
-    draw_road(r, amt, 0, 1);
+    draw_road(r, amt, 0, 1, wh.wd);
 
     /* the four encoders, each in its colour: name, gauge, value. While Shift is held, the four Shift values */
     const int shift = op1_shift_held() != 0;

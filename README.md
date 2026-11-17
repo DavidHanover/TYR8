@@ -62,8 +62,8 @@ whatever envelope the slot had before; set those two first.
 
 ### The screen
 
-A tyre rolls along an isometric road that runs the whole diagonal of the screen, between the labels. Each part
-follows a setting:
+A tyre rolls along an isometric street that runs the whole diagonal of the screen, between the labels: the road,
+a curb, a sidewalk and grass behind it, all scrolling past. Each part follows a setting:
 
 | What you see | Follows |
 |---|---|
@@ -72,7 +72,7 @@ follows a setting:
 | A flat: the bottom squashes onto the road and the sidewall bulges | `SAG` |
 | Rim, from a plain dish to laced lowrider wire spokes, then a whitewall with an orange pinstripe, then a gold knock-off spinner | `SUB` |
 | Spin, and the road's dashed centre line scrolling under it | the pitch, while a note sounds |
-| A bounce on every new note, and ridges on the road | `KNOCK` |
+| A bounce on every new note, and a rough road: rocks in the tyre's path (it hops over them), cracks in the pavement, and from 40 % weeds in the cracks | `KNOCK` |
 
 ### Good to know
 

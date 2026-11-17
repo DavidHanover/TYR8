@@ -22,10 +22,10 @@ grows treads with the sound.
 
 | Thing | State |
 |---|---|
-| Source | 0.9.9 committed on top of `e6a25ca` (0.9.3, pushed). The 0.9.9 commit is not pushed. |
+| Source | Branch `tyr8-0.9.9`: 0.9.9 and 0.9.11 committed on top of `e6a25ca` (0.9.3, pushed). Not pushed or merged. |
 | Not tried on hardware | Most of 0.9.4 to 0.9.9: the T2 page, the Shift-turn takeover, the code-drawn screen (pixel fills), the tail fade. The owner tests by ear on their OP-1. |
-| Host checks | 139 pass (`./build.sh test`). |
-| Plugin file | `build/tyr8.knl`, 37,460 bytes, version 0.9.9, built with Blackfin GCC 13.3.0. Not committed (`build/` is ignored). |
+| Host checks | 142 pass (`./build.sh test`). |
+| Plugin file | `build/tyr8.knl`, 40,556 bytes, version 0.9.11, built with Blackfin GCC 13.3.0. Not committed (`build/` is ignored). |
 | GitHub release | **Not created.** The README links to the releases page, which is empty. The owner was going to make a release with `tyr8.knl` attached (planned as `v0.9.3`; the code is now 0.9.9). There is no `gh` CLI on this machine. |
 | Reddit post | Drafted in `build/reddit_post.md` (ignored). Has two placeholders: the demo clip and a "Tested on" line. |
 | Demo video | `build/tyr8_demo.mp4` (302 MB) and `build/tyr8_demo_reddit.mp4` (48 MB). See section 12. |
@@ -318,7 +318,8 @@ the raster's pixels** (`fill_poly`, even-odd scanline, RGB565, the layout dx_gfx
 - **Projection:** dimetric, one for everything: travel `(0.894, -0.447)`, up `(0, -1)`, depth `(-0.67, -0.335)`.
   `wp()` maps a wheel point (angle, radius, depth) to the screen. The view direction is `(-0.749, 0.67, 1)`, which
   decides which lug faces show.
-- **Painter's order:** road, the tyre's convex hull in black (hides the road), the far face's outline, the 16 lugs
+- **Painter's order:** road, the tyre's convex hull in black (hides the road), the far rim where the tread next to
+  it faces the viewer (`far_edge`; the rest is behind the tread), the 16 lugs
   sorted back to front (visible faces only, each filled then outlined), the near face filled black over the band,
   then the near face's lines, sidewall or whitewall, rim, spokes, hub or spinner, valve.
 - **Lugs:** 16 blocks; even ones on the near half of the tread, odd ones on the far half (staggered). Their height
@@ -330,12 +331,16 @@ the raster's pixels** (`fill_poly`, even-odd scanline, RGB565, the layout dx_gfx
 - **Spokes (sub):** 0 to 40 laced spokes (`vis_spokes`), whitewall above 50 %, gold spinner above 80 %, five lug
   nuts while there are fewer than 12 spokes.
 - **Size:** decay, 0.55 to 0.92. **Spin, bounce, ridges:** as before, the ridges on the road's cross lines.
-- **Road (0.9.8):** a band `ROAD_P0`..`ROAD_P1` deep and `ROAD_LEN` each way, every line clipped to the screen
-  (above y = 150) and cut around the label blocks (`KEEP_OUT`, `road_cut`). The part behind the near face is drawn
-  before the wheel, the part in front after it. A dashed centre line scrolls; ridges with the knock.
+- **Street (0.9.8, 0.9.11):** in road coordinates (s along travel, p across), `ROAD_LEN` each way, every line
+  clipped to the screen (above y = 150) and cut around the label blocks (`KEEP_OUT`, `road_cut`). The road
+  `ROAD_P0`..`ROAD_P1` with a dashed centre line, a curb `KERB_H` up, a sidewalk `WALK_W` deep with joints, grass
+  tufts in a hashed grid behind it. Knock: rocks in the wheel's track at the `bump()` places (the same ones the wheel
+  hops at), cracks (`CRACK_PX` cells, more and longer with the amount), weeds in them from 40 %. Patterns are
+  `hsh()` of a cell index, so they repeat as they scroll. All of it is drawn before the wheel except the road's front
+  edge. The grass is most of the line count: thin it (`GRASS_ROWS`, the density test) if the screen gets slow.
 - **Layout limits:** the largest, flattest tyre stays clear of the label blocks and above y = 150; the tests check
   the real silhouette, and every road line, against the label text.
-- **Cost:** 400 to 600 raster lines a frame plus about 35 fills, on the GUI thread. If the OP-1's screen gets slow,
+- **Cost:** 600 to 850 raster lines a frame (since the street, 0.9.11) plus about 40 fills, on the GUI thread. If the OP-1's screen gets slow,
   thin the rings (`RING_N`) or the spokes first.
 
 ---

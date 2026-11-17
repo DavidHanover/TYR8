@@ -552,6 +552,23 @@ int main(int argc, char **argv)
     for (int i = 0; i < 60; i++) frame("small slick, at rest");
     int lugsides = 0; for (int q = 0; q < npolys; q++) lugsides += polys[q].n == 4;
     CHECK(lugsides == 0, "drive and clip at 0: a racing slick, no tread blocks (%d)", lugsides);
+    /* on a slick the far rim shows only along the tyre's own outline: none of it is drawn across the tread */
+    int hidden = 0, farl = 0;
+    for (int j = 0; j < nlines; j++) {
+        if (lines[j].c[0] != 0xDF || lines[j].c[1] != 0xD9) continue;
+        farl++;
+        const double mx = (lines[j].x0 + lines[j].x1) / 2.0, my = (lines[j].y0 + lines[j].y1) / 2.0;
+        double best = 1e18;
+        for (int i = 0; i < sil_n; i++) {
+            const double ax = sil[i].x, ay = sil[i].y, dx = sil[(i + 1) % sil_n].x - ax, dy = sil[(i + 1) % sil_n].y - ay, L2 = dx * dx + dy * dy;
+            double u = L2 > 0 ? ((mx - ax) * dx + (my - ay) * dy) / L2 : 0;
+            u = u < 0 ? 0 : (u > 1 ? 1 : u);
+            const double d = hypot(mx - ax - u * dx, my - ay - u * dy);
+            if (d < best) best = d;
+        }
+        if (best > 1.5 * 1024) hidden++;
+    }
+    CHECK(farl > 5 && hidden == 0, "the back of the tyre is hidden by the tyre: %d of %d far-rim lines run across the tread", hidden, farl);
     double low, fw, ht, ht_small;
     near_shape(&low, &fw, &ht_small);
     /* the near face's lowest point is in front of the contact, where the road is lower: compare with the road there */
@@ -561,7 +578,12 @@ int main(int argc, char **argv)
     CHECK(above, "no part of the near face goes below the road");
     int blk = 0; for (int i = 0; i < 400 * 256; i++) blk += host_frame565[i] == 0;
     CHECK(blk > 4000, "the tyre's rubber is filled black in the panel's pixels (%d)", blk);
-    host_t2[0][1] = T2_HI; host_knobs[0][6] = 32767; host_knobs[0][1] = 20000;
+    host_t2[0][1] = T2_HI; host_knobs[0][6] = 32767;
+    host_knobs[0][1] = 0; frame("knock 0: a smooth road");
+    CHECK(vis_rocks == 0 && vis_cracks == 0 && vis_weeds == 0 && vis_tufts > 15, "knock 0: no rocks, cracks or weeds; the grass is there (%d tufts)", vis_tufts);
+    host_knobs[0][1] = 32767; frame("knock full: rocks, cracks, weeds");
+    CHECK(vis_rocks >= 3 && vis_cracks >= 6 && vis_weeds >= 2, "knock full: %d rocks, %d cracks, %d weeds", vis_rocks, vis_cracks, vis_weeds);
+    host_knobs[0][1] = 20000;
     for (int i = 0; i < 60; i++) frame("monster truck, off-road lugs, at rest");
     near_shape(&low, &fw, &ht);
     CHECK(ht > ht_small * 1.6 * 1.1, "decay sets the size, and clip the lugs: %.1f px high at the smallest slick, %.1f at the largest with lugs", ht_small, ht);
