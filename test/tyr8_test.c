@@ -10,23 +10,48 @@
 #include "../plugin/tyr8/tyr8.c"
 
 int16_t host_sine[8192]; int32_t host_pitch_inc[128]; uint8_t host_voice_mem[6 * 0x24]; int16_t host_voice_vel[6];
-int16_t host_voice_env[128]; int16_t host_knobs[8][8]; int host_slot;
+int16_t host_voice_env[128]; int16_t host_knobs[8][8]; int16_t host_t2[8][8]; int host_slot;
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } \
                            else { printf("ok:   "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 /* ---- audio driver: six voices as the firmware runs them ---- */
-static void sag(int v) { host_eng_rec[0][4] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
-static void third(int sub, int tone, int atk) { host_eng_rec[0][1] = (int16_t)sub; host_eng_rec[0][2] = (int16_t)tone; host_eng_rec[0][3] = (int16_t)atk; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
+static int sag_w;                             /* sag: word 3 (orange) since 0.9.9 */
+static int16_t P[8];
+static void sag(int v) { sag_w = v; P[3] = (int16_t)v; host_knobs[0][3] = (int16_t)v; }
+static void glide_rec(int v) { host_eng_rec[0][REC_GLIDE] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
+static void sub(int v) { host_eng_rec[0][REC_SUB] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
 static void mode(int m) { host_eng_rec[0][0] = (int16_t)m; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
 #define SINE 8192                             /* the shape knob's plain sine: a quarter up */
-static int16_t P[8];                         /* the sound's words */
+#define T2_LO 64                              /* R246's range of the T2 attack, decay and release words */
+#define T2_HI 16320
+static int tone_w = 32767, atk_w = T2_LO, rel_w = T2_HI;   /* tone open, no attack, release HOLD */
 static int active[6]; static double key_hz[6];      /* the key's own frequency, as the firmware gives it */
 static int16_t *rec; static size_t rec_n, rec_cap;
+static uint32_t audio_hash = 2166136261u;
+static int rec_get_mode(void);     /* FNV-1a over every sample rendered: a speed-up must leave it as it was */
 
+/* the sound, in the 0.9.3 helper's terms: knock length and decay 0..32767, sustain and glide 0..127. Tone, attack and
+ * release come from tone_w, atk_w and rel_w (T2 words) */
 static void set(int osc, int amt, int pdec, int adec, int drive, int clip, int sus, int glide)
-{ P[0] = osc; P[1] = amt; P[2] = pdec; P[3] = adec; P[4] = 0x5300; P[5] = drive; P[6] = clip; P[7] = (int16_t)(sus | glide << 8); }
+{
+    P[0] = osc; P[1] = amt; P[2] = tone_w; P[3] = (int16_t)sag_w; P[4] = 0x5300; P[5] = drive; P[6] = clip; P[7] = pdec;
+    glide_rec(glide * 258);
+    host_t2[0][0] = atk_w; host_t2[0][1] = T2_LO + adec * (T2_HI - T2_LO) / 32767; host_t2[0][2] = sus * 258; host_t2[0][3] = rel_w;
+}
+static void tone(int open) { tone_w = open; P[2] = open; }
+static int t2_of(double frac) { return T2_LO + (int)lrint(frac * (T2_HI - T2_LO)); }   /* a T2 knob at frac of its turn */
+/* a Shift + turn through the input hook: its word writes land in host_eng_words, so carry them over to the sound */
+static int shift_turn(int a, int delta)
+{
+    for (int k = 5; k < 8; k++) host_eng_words[0][k] = host_knobs[0][k];
+    host_shift_held = 1;
+    const int took = ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, a, delta);
+    host_shift_held = 0;
+    for (int k = 5; k < 8; k++) host_knobs[0][k] = host_eng_words[0][k];
+    return took;
+}
 static void reset(void)
 {
     memset((void *)held, 0, sizeof held); owner = -1; memset(tv, 0, sizeof tv);
@@ -48,7 +73,7 @@ static void run_ms(double ms)
             for (int n = 0; n < 128; n++) sum[n] += o[n];
         }
         if (rec_n + 128 > rec_cap) { rec_cap = rec_cap ? rec_cap * 2 : 1 << 20; rec = realloc(rec, rec_cap * 2); }
-        for (int n = 0; n < 128; n++) rec[rec_n++] = op1_sat16(sum[n]);
+        for (int n = 0; n < 128; n++) { rec[rec_n++] = op1_sat16(sum[n]); audio_hash = (audio_hash ^ (uint16_t)rec[rec_n - 1]) * 16777619u; }
     }
 }
 static int peak(size_t a, size_t b) { int p = 0; for (size_t i = a; i < b && i < rec_n; i++) if (abs(rec[i]) > p) p = abs(rec[i]); return p; }
@@ -98,44 +123,101 @@ static void wav(const char *name)
     fclose(f);
 }
 
-/* ---- screen mocks ---- */
-#define NODES 20
-static const char *node_id[NODES] = { "wheel-rig", "wheel-spin", "tread0", "tread1", "tread2", "tread3", "tread4", "tread5",
-    "tread6", "tread7", "tread8", "tread9", "tread10", "tread11", "tread12", "tread13" };
-static int32_t node_m[NODES][9]; static int node_set[NODES];
+/* ---- screen mocks: every line and filled polygon the screen draws, in order ---- */
 typedef struct { int32_t x0, y0, x1, y1, w; uint8_t c[4]; } hline;
-static hline lines[512]; static int nlines; static int drew;
-void *host_find_node(void *scr, const char *id)
-{ (void)scr; for (int i = 0; i < NODES && node_id[i]; i++) if (!strcmp(node_id[i], id)) return (void *)(intptr_t)(i + 1); return 0; }
-void host_node_set_transform(void *node, const int32_t *m) { int i = (int)(intptr_t)node - 1; memcpy(node_m[i], m, 36); node_set[i] = 1; }
-void host_screen_draw(void *scr, int dt) { (void)scr; (void)dt; drew++; }
+typedef struct { int n; op1_pt p[96]; uint8_t c[4]; } hpoly;
+static hline lines[4096]; static int nlines;
+static hpoly polys[256]; static int npolys;
+static int ops[8192], nops;                   /* >= 0: a line, < 0: polygon -1 - i */
+uint16_t host_frame565[400 * 256];
+void host_screen_draw(void *scr, int dt) { (void)scr; (void)dt; }
 void *host_raster(void) { return (void *)1; }
 void host_raster_line(void *r, const void *p0, const void *p1, int32_t w, const uint8_t *c)
 {
     (void)r; const op1_pt *a = p0, *b = p1;
-    if (nlines < 512) { hline *l = &lines[nlines++]; l->x0 = a->x; l->y0 = a->y; l->x1 = b->x; l->y1 = b->y; l->w = w; memcpy(l->c, c, 4); }
+    if (nlines < 4096 && nops < 8192) { hline *l = &lines[nlines]; l->x0 = a->x; l->y0 = a->y; l->x1 = b->x; l->y1 = b->y; l->w = w; memcpy(l->c, c, 4); ops[nops++] = nlines++; }
+}
+void host_fill_poly(const op1_pt *p, int n, const uint8_t *c)
+{
+    if (npolys < 256 && nops < 8192 && n <= 96) { hpoly *q = &polys[npolys]; q->n = n; memcpy(q->p, p, n * sizeof *p); memcpy(q->c, c, 4); ops[nops++] = -1 - npolys++; }
 }
 static FILE *fj; static int nframes;
-static void frame(const char *label)
+static void dump(const char *label)
 {
-    nlines = 0;
-    SCREEN_tyr8.update(0, 16);
     if (!fj) return;
-    fprintf(fj, "%s{\"label\":\"%s\",\"nodes\":{", nframes++ ? ",\n" : "", label);
-    for (int i = 0, n = 0; i < NODES && node_id[i]; i++) if (node_set[i]) {
-        fprintf(fj, "%s\"%s\":[", n++ ? "," : "", node_id[i]);
-        for (int j = 0; j < 9; j++) fprintf(fj, "%s%d", j ? "," : "", node_m[i][j]);
-        fprintf(fj, "]");
+    fprintf(fj, "%s{\"label\":\"%s\",\"ops\":[", nframes++ ? ",\n" : "", label);
+    for (int i = 0; i < nops; i++) {
+        if (i) fputc(',', fj);
+        if (ops[i] >= 0) { const hline *l = &lines[ops[i]]; fprintf(fj, "[\"L\",%d,%d,%d,%d,%d,%d,%d,%d]", l->x0, l->y0, l->x1, l->y1, l->w, l->c[0], l->c[1], l->c[2]); }
+        else {
+            const hpoly *q = &polys[-1 - ops[i]];
+            fprintf(fj, "[\"P\",[");
+            for (int j = 0; j < q->n; j++) fprintf(fj, "%s%d,%d", j ? "," : "", q->p[j].x, q->p[j].y);
+            fprintf(fj, "],%d,%d,%d]", q->c[0], q->c[1], q->c[2]);
+        }
     }
-    fprintf(fj, "},\"lines\":[");
-    for (int i = 0; i < nlines; i++)
-        fprintf(fj, "%s[%d,%d,%d,%d,%d,%d,%d,%d]", i ? "," : "", lines[i].x0, lines[i].y0, lines[i].x1, lines[i].y1, lines[i].w,
-                lines[i].c[0], lines[i].c[1], lines[i].c[2]);
     fprintf(fj, "]}");
 }
-/* where the matrix of node i puts drawing point (x, y), in px */
-static void map(int i, double x, double y, double *ox, double *oy)
-{ const int32_t *m = node_m[i]; *ox = (x * m[0] + y * m[3]) / 1024 + m[6] / 1024.0; *oy = (x * m[1] + y * m[4]) / 1024 + m[7] / 1024.0; }
+static void frame_of(const op1_screen_t *scr, const char *label)
+{
+    nlines = npolys = nops = 0;
+    for (int i = 0; i < 400 * 256; i++) host_frame565[i] = 0xFFFF;
+    scr->update(0, 16);
+    dump(label);
+}
+static void frame(const char *label) { frame_of(&SCREEN_tyr8, label); }
+
+/* inside a convex polygon (either winding), Q10 px */
+static int in_convex(const op1_pt *p, int n, double x, double y)
+{
+    int pos = 0, neg = 0;
+    for (int i = 0; i < n; i++) {
+        const op1_pt a = p[i], b = p[(i + 1) % n];
+        const double c = (double)(b.x - a.x) * (y - a.y) - (double)(b.y - a.y) * (x - a.x);
+        if (c > 0) pos = 1; else if (c < 0) neg = 1;
+    }
+    return !(pos && neg);
+}
+/* does a stroke (Q10 px) come within 2 px of the tyre's silhouette or a road line as last drawn */
+static int on_tyre(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    for (int k = 0; k <= 8; k++) {
+        const double px = x0 + (x1 - x0) * k / 8.0, py = y0 + (y1 - y0) * k / 8.0;
+        for (int d = 0; d < 5; d++) {
+            const double ox = d == 1 ? 2048 : d == 2 ? -2048 : 0, oy = d == 3 ? 2048 : d == 4 ? -2048 : 0;
+            if (sil_n > 2 && in_convex(sil, sil_n, px + ox, py + oy)) return 1;
+        }
+        for (int i = 0; i < road_nseg; i++) {                   /* within 2 px of a road line */
+            const double ax = road_seg[i][0].x, ay = road_seg[i][0].y, bx = road_seg[i][1].x, by_ = road_seg[i][1].y;
+            const double dx = bx - ax, dy = by_ - ay, L2 = dx * dx + dy * dy;
+            double u = L2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / L2 : 0;
+            u = u < 0 ? 0 : (u > 1 ? 1 : u);
+            if (hypot(px - ax - u * dx, py - ay - u * dy) < 2048) return 1;
+        }
+    }
+    return 0;
+}
+/* the near face's outline as last drawn, measured against the road it stands on (which runs diagonally on screen):
+ * how wide (along the road) the part within 0.75 px of its lowest point is, and its height above the road */
+static void near_shape(double *low, double *flat_w, double *height)
+{
+    op1_pt nf[LUG_N / 2 * 5];
+    wheel_t w = last_wheel;
+    const int n = outline(&w, -(int32_t)(ang >> 8), 0, nf);
+    double hmin = 1e9, hmax = -1e9, s0 = 1e9, s1 = -1e9;
+    for (int i = 0; i < n; i++) {
+        const double sx = (nf[i].x / 1024.0 - CON_X) / 0.894, h = (CON_Y - 0.447 * sx) - nf[i].y / 1024.0;
+        if (h < hmin) hmin = h;
+        if (h > hmax) hmax = h;
+    }
+    for (int i = 0; i < n; i++) {
+        const double sx = (nf[i].x / 1024.0 - CON_X) / 0.894, h = (CON_Y - 0.447 * sx) - nf[i].y / 1024.0;
+        if (h < hmin + 0.75) { if (sx < s0) s0 = sx; if (sx > s1) s1 = sx; }
+    }
+    *low = hmin; *flat_w = s1 - s0; *height = hmax - hmin;
+}
+
+static int rec_get_mode(void) { return mode_of(0); }
 
 int main(int argc, char **argv)
 {
@@ -260,34 +342,35 @@ int main(int argc, char **argv)
     CHECK(!active[0] && !active[1], "mono retrig: both voices are given back");
     reset(); set(SINE, 0, 0, 6000, 0, 0, 127, 127); on(0, 55, 127); run_ms(300); tm = rec_n; on(1, 110, 127); run_ms(200); size_t tb = rec_n; offk(1); run_ms(200);
     CHECK(fabs(freq(tm + at(10), tm + at(60)) - 110) < 1 && fabs(freq(tb + at(10), tb + at(60)) - 55) < 1, "mono retrig never glides, even with glide at maximum (%.1f, then %.1f Hz)", freq(tm + at(10), tm + at(60)), freq(tb + at(10), tb + at(60)));
-    mode(MODE_POLY); reset(); set(SINE, 0, 0, 6000, 0, 0, 127, 100);
-    on(0, 55, 127); run_ms(300); int one = peak(at(100), rec_n); on(1, 82.5, 127); run_ms(300);
-    CHECK(one > 16000 && one <= 16384, "poly: one note is at half level (peak %d)", one);
-    CHECK(peak(at(400), rec_n) > one * 3 / 2 && active[0] && active[1], "poly: two keys sound together (peak %d)", peak(at(400), rec_n));
+    mode(2); reset(); set(SINE, 0, 0, 6000, 0, 0, 127, 0);    /* a sound saved in 0.9.8's POLY (2) */
+    on(0, 55, 127); run_ms(300); on(1, 82.5, 127); run_ms(300);
+    CHECK(rec_get_mode() == MODE_GLIDE && peak(0, rec_n) <= 32768 && fabs(freq(at(400), rec_n) - 82.5) < 0.5, "a sound saved in the old POLY plays in mono glide: one voice, the newest key (%.1f Hz)", freq(at(400), rec_n));
     offk(0); offk(1); run_ms(1500);
-    CHECK(!active[0] && !active[1] && peak(rec_n - at(100), rec_n) == 0, "poly: both voices end");
-    wav("poly_fifth");
     mode(MODE_GLIDE); host_slot = 0;
     CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1) == 1 && host_eng_rec[0][0] == MODE_RETRIG, "orange push: glide -> retrig");
     ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 0); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1);
-    CHECK(host_eng_rec[0][0] == MODE_POLY, "orange push: retrig -> poly");
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1);
-    CHECK(host_eng_rec[0][0] == MODE_GLIDE, "orange push: poly -> glide");
+    CHECK(host_eng_rec[0][0] == MODE_GLIDE, "orange push: retrig -> glide (two modes, no poly)");
     CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 3, 1024) == 0 && ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1) == 0 && host_eng_rec[0][0] == MODE_GLIDE, "orange's turn, and other pages, are left to the OP-1");
+    host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1); host_shift_held = 0;
+    CHECK(host_eng_rec[0][0] == MODE_RETRIG, "orange push with Shift held still steps the play mode");
+    mode(MODE_GLIDE);
 
-    /* 12. the third values: attack, tone, sub */
+    /* 12. attack (T2 blue), tone, sub */
     for (int c = 0; c < 2; c++) {                               /* no drive, then full drive and hard clip */
-        mode(MODE_GLIDE); third(0, 0, ALT_MAX); reset(); set(SINE, 0, 0, 20000, c ? 32767 : 0, c ? 32767 : 0, 127, 0); on(0, 55, 127); run_ms(300);
+        mode(MODE_GLIDE); atk_w = t2_of(sqrt(0.1)); reset(); set(SINE, 0, 0, 20000, c ? 32767 : 0, c ? 32767 : 0, 127, 0); on(0, 55, 127); run_ms(300);
         CHECK(peak(0, at(5)) < 2000 && peak(at(40), at(60)) > 11000 && peak(at(40), at(60)) < 21000 && peak(at(150), rec_n) > 32000,
               "attack 100 ms, %s: a slow fade-in (peaks %d at 5 ms, %d at 50 ms, %d after)", c ? "full drive" : "no drive", peak(0, at(5)), peak(at(40), at(60)), peak(at(150), rec_n));
         if (c) wav("attack_100ms");
     }
-    third(0, 0, ALT_MAX); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 0, 0); on(0, 55, 127); run_ms(104); offk(0); run_ms(10); size_t ta = rec_n; on(1, 55, 127); run_ms(100);
+    atk_w = T2_HI; reset(); set(SINE, 0, 0, 32767, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(1200);
+    CHECK(peak(at(400), at(520)) < 20000 && peak(at(1050), rec_n) > 32000, "attack at maximum: a 1 s swell (peaks %d at 0.45 s, %d after 1 s)", peak(at(400), at(520)), peak(at(1050), rec_n));
+    atk_w = t2_of(sqrt(0.1)); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 0, 0); on(0, 55, 127); run_ms(104); offk(0); run_ms(10); size_t ta = rec_n; on(1, 55, 127); run_ms(100);
     int stp = 0; for (size_t i = ta - 50; i < ta + 400; i++) if (abs(rec[i] - rec[i - 1]) > stp) stp = abs(rec[i] - rec[i - 1]);
     CHECK(stp < 1500, "attack: a restart over a sounding note does not click (largest sample step %d)", stp);
+    atk_w = T2_LO;
     double hfm[3], rmsm[3];
     for (int c = 0; c < 3; c++) {                               /* full drive, hard: plain, tone closed, sub full */
-        third(c == 2 ? ALT_MAX : 0, c == 1 ? ALT_MAX : 0, 0); reset(); set(SINE, 0, 0, 6000, 32767, 32767, 127, 0); on(0, 55, 127); run_ms(600);
+        sub(c == 2 ? 32767 : 0); tone(c == 1 ? 0 : 32767); reset(); set(SINE, 0, 0, 6000, 32767, 32767, 127, 0); on(0, 55, 127); run_ms(600);
         double e = 0, de = 0;
         for (size_t i = at(300); i < rec_n; i++) { e += (double)rec[i] * rec[i]; de += (double)(rec[i] - rec[i - 1]) * (rec[i] - rec[i - 1]); }
         hfm[c] = de / e; rmsm[c] = sqrt(e / (rec_n - at(300)));
@@ -295,23 +378,47 @@ int main(int argc, char **argv)
         if (c) wav(c == 1 ? "tone_closed" : "sub_full");
     }
     CHECK(hfm[1] < hfm[0] / 20, "tone closed: 1/%.0f of the treble", hfm[0] / hfm[1]);
-    CHECK(hfm[2] < hfm[0] * 0.2 && rmsm[2] > 16000, "sub full: mostly the clean sine, still loud (treble 1/%.0f, rms %.0f)", hfm[0] / hfm[2], rmsm[2]);
-    third(0, 0, 0);
-    host_slot = 0; host_shift_held = 0; memset((void *)alt, 0, sizeof alt);
-    CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 1024) == 0, "an unpushed encoder's turn is the OP-1's");
-    CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 1) == 1 && alt[0] && ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 3 * 1024) == 1 && host_eng_rec[0][REC_SUB] == 3,
-          "blue push, then three detents: sub is %d", host_eng_rec[0][REC_SUB]);
-    host_shift_held = 1;
-    CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 1024) == 0 && host_eng_rec[0][REC_SUB] == 3, "with Shift the turn still goes to drive");
-    host_shift_held = 0;
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, -100 * 1024);
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 1, -2 * 1024);
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 2, 200 * 1024);
-    CHECK(host_eng_rec[0][REC_SUB] == 0 && host_eng_rec[0][REC_TONE] == 2 && host_eng_rec[0][REC_ATTACK] == ALT_MAX && host_eng_rec[0][REC_MODE] == MODE_GLIDE,
-          "values stop at their ends; turning tone down closes it (sub %d, tone %d, attack %d)", host_eng_rec[0][REC_SUB], host_eng_rec[0][REC_TONE], host_eng_rec[0][REC_ATTACK]);
+    CHECK(hfm[2] < hfm[0] * 0.3 && rmsm[2] > 16000, "sub full, full drive: a third of the treble, still loud (treble 1/%.1f, rms %.0f)", hfm[0] / hfm[2], rmsm[2]);
+    sub(0); tone(32767);
+    reset(); set(SINE, 0, 0, 6000, 14000, 12000, 127, 0); tone(16384); on(0, 55, 127); run_ms(600);
+    { double e = 0, de = 0; for (size_t i = at(300); i < rec_n; i++) { e += (double)rec[i] * rec[i]; de += (double)(rec[i] - rec[i - 1]) * (rec[i] - rec[i - 1]); }
+      reset(); tone(32767); on(0, 55, 127); run_ms(600);
+      double e2 = 0, de2 = 0; for (size_t i = at(300); i < rec_n; i++) { e2 += (double)rec[i] * rec[i]; de2 += (double)(rec[i] - rec[i - 1]) * (rec[i] - rec[i - 1]); }
+      reset(); tone(8192); on(0, 55, 127); run_ms(600);
+      double e3 = 0, de3 = 0; for (size_t i = at(300); i < rec_n; i++) { e3 += (double)rec[i] * rec[i]; de3 += (double)(rec[i] - rec[i - 1]) * (rec[i] - rec[i - 1]); }
+      tone(32767);
+      CHECK(de / e < de2 / e2 / 1.3 && de3 / e3 < de / e / 1.5, "tone, default drive: half open has 1/%.2f of the open treble, a quarter 1/%.2f (the whole turn is heard)", (de2 / e2) / (de / e), (de2 / e2) / (de3 / e3)); }
+
+    /* 12b. the input hook: a plain turn is the OP-1's, every Shift + turn is TYR8's */
+    host_slot = 0; host_shift_held = 0; blue_clip = 0; memset(host_eng_rec[0], 0, sizeof host_eng_rec[0]); mode(MODE_GLIDE);
+    memset(host_knobs, 0, sizeof host_knobs); host_knobs[0][5] = 14000; host_knobs[0][6] = 12000; host_knobs[0][7] = 4500;
+    CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 1024) == 0 && ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 2, 1024) == 0, "a plain turn is the OP-1's");
+    CHECK(shift_turn(0, 4 * 1024) == 1 && host_knobs[0][5] == 15024 && host_knobs[0][6] == 12000, "Shift + blue, four detents: drive %d (+1024), clip untouched", host_knobs[0][5]);
+    host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 0); host_shift_held = 0;
+    CHECK(blue_clip == 1 && shift_turn(0, -2 * 1024) == 1 && host_knobs[0][6] == 11488 && host_knobs[0][5] == 15024, "Shift + blue push switches to clip: clip %d, drive kept", host_knobs[0][6]);
     ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 1);
-    CHECK(!alt[0] && alt[1] && alt[2], "a second push switches the knob back");
-    third(0, 0, 0); memset((void *)alt, 0, sizeof alt);
+    CHECK(blue_clip == 1, "a blue push without Shift does not switch");
+    host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 1); host_shift_held = 0;
+    CHECK(blue_clip == 0, "a second Shift + blue push is back to drive");
+    shift_turn(1, 300 * 1024);
+    CHECK(host_knobs[0][7] == 32767, "Shift + green: knock length, stops at the top (%d)", host_knobs[0][7]);
+    shift_turn(2, 10 * 1024); shift_turn(3, 3 * 1024); shift_turn(3, -1024);
+    CHECK(host_eng_rec[0][REC_SUB] == 2560 && host_eng_rec[0][REC_GLIDE] == 512 && host_eng_rec[0][REC_MODE] == MODE_GLIDE, "Shift + white: sub %d, Shift + orange: glide %d, the mode kept", host_eng_rec[0][REC_SUB], host_eng_rec[0][REC_GLIDE]);
+    shift_turn(2, -100 * 1024);
+    CHECK(host_eng_rec[0][REC_SUB] == 0, "sub stops at 0");
+    CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_TURN, 0, 1024) == 0, "T2's turns are the OP-1's (it turns the envelope words)");
+    memset(host_eng_rec[0], 0, sizeof host_eng_rec[0]); mode(MODE_GLIDE);
+
+    /* 12c. release (T2 orange) and the defaults of a slot with no T2 words */
+    rel_w = T2_LO; reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(500); offk(0); size_t tk = rec_n; run_ms(300);
+    CHECK(peak(tk + at(40), rec_n) < 300, "release at 0: a held note is gone 40 ms after the key (peak %d)", peak(tk + at(40), rec_n));
+    rel_w = t2_of(0.6); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(500); offk(0); tk = rec_n; run_ms(1500);
+    CHECK(peak(tk + at(100), tk + at(150)) > 8000 && peak(rec_n - at(100), rec_n) < 200, "release at 60 %%: a tail of a few hundred ms (peaks %d at 0.1 s, %d at 1.5 s)", peak(tk + at(100), tk + at(150)), peak(rec_n - at(100), rec_n));
+    rel_w = T2_LO; reset(); set(SINE, 0, 0, 20000, 14000, 12000, 0, 0); on(0, 55, 127); run_ms(40); offk(0); tk = rec_n; run_ms(300);
+    CHECK(peak(tk + at(40), rec_n) < 300, "release at 0 cuts a one-shot at the key too (peak %d)", peak(tk + at(40), rec_n));
+    rel_w = T2_HI;
+    reset(); set(SINE, 14000, 9000, 16000, 6000, 8000, 0, 0); memset(host_t2[0], 0, sizeof host_t2[0]); on(0, 55, 127); run_ms(40); offk(0); run_ms(3000);
+    CHECK(peak(at(60), at(300)) > 4000 && peak(at(2500), rec_n) == 0 && !active[0], "no T2 words: the 808 one-shot (peak %d after the key)", peak(at(60), at(300)));
 
     /* 13. the shape knob is heard at the default drive: sine, triangle and saw differ in treble */
     double sh[3];
@@ -325,9 +432,9 @@ int main(int argc, char **argv)
     CHECK(sh[2] > sh[0] * 4, "shape at the default drive: saw has %.1f times the treble of sine (triangle %.1f)", sh[2] / sh[0], sh[1] / sh[0]);
 
     /* 14. the clipper is last: with the tone closed the output is still at full scale, and darker */
-    third(0, ALT_MAX, 0); reset(); set(SINE, 0, 0, 6000, 32767, 32767, 127, 0); on(0, 55, 127); run_ms(500);
+    tone(0); reset(); set(SINE, 0, 0, 6000, 32767, 32767, 127, 0); on(0, 55, 127); run_ms(500);
     CHECK(peak(at(200), rec_n) > 32000, "tone closed at full drive: a dark wall, still full scale (peak %d)", peak(at(200), rec_n));
-    third(0, 0, 0);
+    tone(32767);
 
     /* 15. feedback at both ends of the shape knob; none in between */
     double per[5];                                               /* how badly one cycle fails to repeat the last, 0 .. */
@@ -354,40 +461,43 @@ int main(int argc, char **argv)
     CHECK(freq(at(450), at(550)) > 65 && fabs(freq(at(2700), rec_n) - 55) < 0.5, "knock length 1.5 s: still %.1f Hz at 0.5 s, home at the end (%.2f)", freq(at(450), at(550)), freq(at(2700), rec_n));
     wav("knock_long");
 
-    /* 17. sag: the pitch falls while the note lasts; white's second push */
-    sag(ALT_MAX); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
+    /* 17. sag: the pitch falls while the note lasts */
+    sag(32767); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
     double fs0 = freq(0, at(60)), fs1 = freq(at(500), at(700));
     CHECK(fs0 < 55 && fs0 > 50 && fs1 < fs0 * 0.75 && fs1 > 12, "sag at maximum: %.1f Hz at the start, %.1f Hz half a second on", fs0, fs1);
     wav("sag");
-    sag(ALT_MAX / 2); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
+    sag(16384); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
     CHECK(freq(at(500), at(700)) > fs1 * 1.1 && freq(at(500), at(700)) < 54, "sag at half falls less (%.1f Hz)", freq(at(500), at(700)));
     sag(0); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
     CHECK(fabs(freq(at(500), at(700)) - 55) < 0.3, "sag at 0: none (%.2f Hz)", freq(at(500), at(700)));
-    memset((void *)alt, 0, sizeof alt); host_shift_held = 0;
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 0);
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 2, 5 * 1024);
-    CHECK(alt[2] == 2 && host_eng_rec[0][REC_SAG] == 5 && host_eng_rec[0][REC_ATTACK] == 0, "white pushed twice turns sag (%d), not attack", host_eng_rec[0][REC_SAG]);
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 1);
-    CHECK(alt[2] == 0, "a third push of white is back to knock length");
-    sag(0); third(0, 0, 0);
+    sag(0);
 
     /* the sound this was for: full feedback saw, a long deep knock, sag, drive up, the tone half closed */
-    sag(40); third(0, 28, 0); reset(); set(31500, 22000, 20000, 26000, 28000, 26000, 0, 0);
+    sag(20479); tone(18430); reset(); set(31500, 22000, 20000, 26000, 28000, 26000, 0, 0);
     on(0, 43.65, 127); run_ms(150); offk(0); run_ms(1400); on(1, 38.89, 127); run_ms(150); offk(1); run_ms(5000);
     CHECK(peak(0, rec_n) <= 32768 && !active[0] && !active[1] && peak(rec_n - at(100), rec_n) == 0, "the doom patch stays in range and ends");
     wav("doom");
-    sag(0); third(0, 0, 0);
+    sag(0); tone(32767);
 
-    /* 18. the tail stays a clean tone as it dies away: 882 Hz / 16 = 55.125 Hz is exactly 1600 samples a cycle */
+    /* 18. the tail: a clean tone while it is loud enough to have bits for it, then a fast fade to exact silence instead
+     * of half a second as a staircase of a few output levels (what a crusher after the synth turns into grit).
+     * 882 Hz / 16 = 55.125 Hz is exactly 1600 samples a cycle */
     for (int c = 0; c < 3; c++) {
         const int drv[3] = { 0, 14000, 32767 };
-        reset(); set(SINE, 0, 0, 16000, drv[c], 12000, 0, 0); on(0, 55.125, 127); run_ms(40); offk(0); run_ms(2500);
-        /* by 0.9 s the note has fallen 61 dB; at full drive it is still at -27 dBFS, with all that gain on its rounding */
-        const double q7 = tail_snr(at(700), at(800), 55.125), q9 = tail_snr(at(900), at(1000), 55.125);
-        CHECK(q7 > 42 && q9 > (c ? 36 : 28), "drive %d %%: the tail is a clean tone, %.0f dB over its noise at 0.7 s (peak %d), %.0f dB at 0.9 s (peak %d)",
-              drv[c] * 100 / 32767, q7, peak(at(700), at(800)), q9, peak(at(900), at(1000)));
+        reset(); set(SINE, 0, 0, 16000, drv[c], 12000, 0, 0); on(0, 55.125, 127); run_ms(40); offk(0); run_ms(3000);
+        size_t low = 0, end = rec_n;                             /* where the peak first stays under 96, and the last sound */
+        while (end && !rec[end - 1]) end--;
+        for (size_t i = at(100); i + at(30) < rec_n; i += at(10)) if (peak(i, i + at(30)) < 96) { low = i; break; }
+        const double tq = c == 2 ? 750 : 500, q = tail_snr(at(tq), at(tq + 100), 55.125);   /* full drive: past its flat-out part */
+        CHECK(q > 40, "drive %d %%: the tail is a clean tone while it is loud, %.0f dB over its noise at %.2f s (peak %d)", drv[c] * 100 / 32767, q, tq / 1000, peak(at(tq), at(tq + 100)));
+        CHECK(low && end > low && (end - low) / 88.2 < 100, "drive %d %%: below -51 dBFS it fades to silence in %.0f ms (ends at %.0f ms)", drv[c] * 100 / 32767, (end - low) / 88.2, end / 88.2);
+        int jump = 0; for (size_t i = low; i < end + 10 && i < rec_n; i++) if (abs(rec[i] - rec[i - 1]) > jump) jump = abs(rec[i] - rec[i - 1]);
+        CHECK(jump < 60, "drive %d %%: and the fade is smooth, no click into silence (largest step %d)", drv[c] * 100 / 32767, jump);
         if (c == 2) wav("tail_full_drive");
     }
+    reset(); set(SINE, 0, 0, 16000, 14000, 12000, 1, 0); on(0, 55, 127); run_ms(3000);
+    CHECK(peak(rec_n - at(100), rec_n) > 0 && active[0], "a held note at a tiny sustain (1 %%) is not faded away (peak %d)", peak(rec_n - at(100), rec_n));
+    offk(0); run_ms(1000);
 
     /* 19. clip is heard: at the default drive, hard is far brighter than soft; with no drive it squares the sine */
     double ch[2], cr[2];
@@ -405,13 +515,26 @@ int main(int argc, char **argv)
     CHECK(ch[1] > ch[0] * 2.5, "clip at the default drive: hard has %.1f times the treble of soft", ch[1] / ch[0]);
     CHECK(cr[0] < 0.85 && cr[1] > 0.93, "clip with no drive: a rounded sine at soft (rms %.2f), nearly square at hard (rms %.2f)", cr[0], cr[1]);
 
-    /* 20. the sub is a sine at the note, whatever the shape: full sub, no drive, soft clip, tone closed to leave the sub */
+    /* 20. the sub is heard: blended in after the clipper, its clean sine takes over the low end as it goes up. Measured
+     * as the share of the output that is a 55 Hz sine, at the default drive and at full drive, sine and saw. (Before
+     * 0.9.7 it was mixed in before the clipper, which squared it again: turning it up thinned the sound) */
     for (int c = 0; c < 4; c++) {
-        const int shp[4] = { 8192, 24576, 0, 32767 };
-        third(ALT_MAX, ALT_MAX, 0); reset(); set(shp[c], 0, 0, 6000, 0, 0, 127, 0); on(0, 55, 127); run_ms(700);
-        CHECK(sine_part(at(300), at(700), 55) > 0.985, "sub with shape %d %%: %.1f %% of the output is a 55 Hz sine", shp[c] * 200 / 32767 - 50, sine_part(at(300), at(700), 55) * 100);
+        const int shp = c & 1 ? 24576 : SINE, drv = c & 2 ? 32767 : 14000;
+        double part[2];
+        for (int v = 0; v < 2; v++) {
+            sub(v ? 32767 : 0); reset(); set(shp, 0, 4500, 16000, drv, 12000, 127, 0); on(0, 55, 127); run_ms(700);
+            part[v] = sine_part(at(300), at(700), 55) * sine_part(at(300), at(700), 55);
+        }
+        CHECK(part[1] > 0.86 && part[1] > part[0] + 0.07, "sub, %s, drive %d %%: the 55 Hz sine is %.0f %% of the output at sub 0, %.0f %% at full",
+              c & 1 ? "saw" : "sine", drv * 100 / 32767, part[0] * 100, part[1] * 100);
+        if (c == 3) wav("sub_full_drive_saw");
     }
-    third(0, 0, 0);
+    for (int c = 0; c < 4; c++) {                               /* and with no drive, whatever the shape, it is the sine */
+        const int shp[4] = { 8192, 24576, 0, 32767 };
+        sub(32767); tone(0); reset(); set(shp[c], 0, 0, 6000, 0, 0, 127, 0); on(0, 55, 127); run_ms(700);
+        CHECK(sine_part(at(300), at(700), 55) > (c < 2 ? 0.985 : 0.72), "sub full, no drive, shape %d %%: %.1f %% of the output's amplitude is a 55 Hz sine", shp[c] * 200 / 32767 - 50, sine_part(at(300), at(700), 55) * 100);
+    }
+    sub(0); tone(32767);
 
     /* a phrase to listen to */
     reset(); set(10000, 14000, 6000, 20000, 14000, 12000, 0, 60);
@@ -423,58 +546,72 @@ int main(int argc, char **argv)
     /* ---- screen ---- */
     if (outdir) { char path[512]; snprintf(path, sizeof path, "%s/frames.json", outdir); fj = fopen(path, "w"); if (fj) fprintf(fj, "["); }
     SCREEN_tyr8.init(0);
-    CHECK(n_rig && n_spin && n_tread[13], "the screen finds its SVG nodes");
     reset(); vis_lvl = 0; vis_inc = 0;
-    memset(host_knobs, 0, sizeof host_knobs);
-    host_knobs[0][3] = 0; host_knobs[0][6] = 0;
+    memset(host_knobs, 0, sizeof host_knobs); sub(0); sag(0);
+    host_knobs[0][6] = 0; host_knobs[0][5] = 0; host_t2[0][1] = T2_LO;
     for (int i = 0; i < 60; i++) frame("small slick, at rest");
-    double x, y, x2, y2;
-    map(0, TY_HUB_X, TY_HUB_Y + TY_R_TYRE, &x, &y);
-    CHECK(fabs(y - (TY_GROUND_Y - 0.75)) < 0.6, "at rest the tyre stands on the ground (bottom y %.2f)", y);
-    map(0, TY_HUB_X, TY_HUB_Y - TY_R_TYRE, &x2, &y2);
-    CHECK(fabs((y - y2) - 2 * 0.43 * TY_R_TYRE) < 1, "amp decay 0: a small tyre (diameter %.1f px)", y - y2);
-    host_knobs[0][3] = 32767; host_knobs[0][6] = 32767; host_knobs[0][1] = 20000;
+    int lugsides = 0; for (int q = 0; q < npolys; q++) lugsides += polys[q].n == 4;
+    CHECK(lugsides == 0, "drive and clip at 0: a racing slick, no tread blocks (%d)", lugsides);
+    double low, fw, ht, ht_small;
+    near_shape(&low, &fw, &ht_small);
+    /* the near face's lowest point is in front of the contact, where the road is lower: compare with the road there */
+    CHECK(fabs(vis_hub_y / 1024.0 + last_wheel.rout / 1024.0 - CON_Y) < 0.6, "at rest the tyre stands on the road (contact y %.2f)", vis_hub_y / 1024.0 + last_wheel.rout / 1024.0);
+    int above = 1; { op1_pt nf[LUG_N / 2 * 5]; wheel_t w = last_wheel; const int n = outline(&w, -(int32_t)(ang >> 8), 0, nf);
+        for (int i = 0; i < n; i++) { const double sx = (nf[i].x / 1024.0 - CON_X) / 0.894, ry = CON_Y - 0.447 * sx; if (nf[i].y / 1024.0 > ry + 0.6) above = 0; } }
+    CHECK(above, "no part of the near face goes below the road");
+    int blk = 0; for (int i = 0; i < 400 * 256; i++) blk += host_frame565[i] == 0;
+    CHECK(blk > 4000, "the tyre's rubber is filled black in the panel's pixels (%d)", blk);
+    host_t2[0][1] = T2_HI; host_knobs[0][6] = 32767; host_knobs[0][1] = 20000;
     for (int i = 0; i < 60; i++) frame("monster truck, off-road lugs, at rest");
-    map(0, TY_HUB_X, TY_HUB_Y - TY_R_TYRE, &x2, &y2); map(0, TY_HUB_X, TY_HUB_Y + TY_R_TYRE, &x, &y);
-    CHECK(fabs((y - y2) - 2 * 0.94 * TY_R_TYRE) < 1, "amp decay max: full size (diameter %.1f px)", y - y2);
-    /* tread 0 sits at angle 0 (+x); with the wheel unturned its outer edge must be R + H out, on the hub's height */
-    double ang0 = (ang >> 8) * 2 * M_PI / 8192, hubx, huby;
-    map(0, TY_HUB_X, TY_HUB_Y, &hubx, &huby);
-    map(2, TY_HUB_X + TY_R_TYRE + TY_TREAD_H, TY_HUB_Y, &x, &y);
-#define FACE_R (hypot((x - hubx) * 1024.0 / TY_KX, y - huby) / 0.94)   /* radius in the wheel's face, full-size px */
-    CHECK(fabs(FACE_R - (TY_R_TYRE + TY_TREAD_H)) < 0.8 && fabs(atan2(y - huby, (x - hubx) * 1024.0 / TY_KX) - ang0) < 0.02,
-          "full lugs stand %d px out of the tyre (r %.1f)", TY_TREAD_H, FACE_R);
-    map(0, TY_HUB_X + TY_R_TYRE, TY_HUB_Y, &x2, &y2);
-    CHECK(fabs((x2 - hubx) - 0.94 * TY_R_TYRE * TY_KX / 1024.0) < 0.6, "three-quarter view: the face is %.0f %% as wide as it is high", (x2 - hubx) / (0.94 * TY_R_TYRE) * 100);
-    int far = 0; for (int j = 0; j < nlines; j++) if (lines[j].w != 1024 && lines[j].y0 < OP1_Q10(TY_GROUND_Y - 6) && lines[j].x0 > OP1_Q10(96) && lines[j].x0 < OP1_Q10(224)) far++;
-    CHECK(far >= 20 && far <= 45, "the far sides of the lugs are drawn on the side that shows (%d lines)", far);
-    double lowest = 0; for (int i = 0; i < TY_TREAD_N; i++) { double a = 2 * M_PI * i / TY_TREAD_N; map(2 + i, TY_HUB_X + (TY_R_TYRE + TY_TREAD_H) * cos(a), TY_HUB_Y + (TY_R_TYRE + TY_TREAD_H) * sin(a), &x, &y); if (y > lowest) lowest = y; }
-    CHECK(lowest < TY_GROUND_Y && lowest > TY_GROUND_Y - 4, "the lugs reach the ground, not through it (lowest %.2f)", lowest);
-    host_knobs[0][6] = 0; frame("slick");
-    map(2, TY_HUB_X + TY_R_TYRE + TY_TREAD_H, TY_HUB_Y, &x, &y); map(0, TY_HUB_X, TY_HUB_Y, &hubx, &huby);
-    CHECK(fabs(FACE_R - TY_R_TYRE) < 0.8, "clip shape 0: the lugs lie flat on the tyre (r %.1f)", FACE_R);
-    host_knobs[0][6] = 32767;
-    /* a note: bounce and spin */
+    near_shape(&low, &fw, &ht);
+    CHECK(ht > ht_small * 1.6 * 1.1, "decay sets the size, and clip the lugs: %.1f px high at the smallest slick, %.1f at the largest with lugs", ht_small, ht);
+    host_knobs[0][6] = 0; frame("big slick"); double ht_slick; near_shape(&low, &fw, &ht_slick);
+    host_knobs[0][5] = 32767; frame("big, clip 0, drive full"); double ht_drv; near_shape(&low, &fw, &ht_drv);
+    CHECK(fabs(ht_drv - ht) < 0.6, "drive alone raises the lugs as clip does: the higher of the two (%.1f and %.1f px)", ht_drv, ht);
+    host_knobs[0][5] = 0;
+    CHECK(ht - ht_slick > 2 * 9 * 0.92 * 0.8, "full lugs stand out of the slick (%.1f px higher)", ht - ht_slick);
+    host_knobs[0][6] = 32767; frame("monster truck again");
+    double fw0; near_shape(&low, &fw0, &ht);
+    CHECK(low > -0.6 && low < 0.6, "the lowest point of the near face is on the road (%.2f px above it)", low);
+    sag(32767); frame("flat: sag full"); double fw1, ht1; near_shape(&low, &fw1, &ht1);
+    CHECK(fw1 > fw0 + 15 && ht1 < ht - 6 && low > -0.6 && low < 0.6, "sag flattens the bottom onto the road: %.1f px of it on the road (%.1f round), %.1f px lower", fw1, fw0, ht - ht1);
+    CHECK(fabs(vis_hub_y / 1024.0 + (last_wheel.rout - last_wheel.q) / 1024.0 - CON_Y) < 0.6, "and the flat stays on the road");
+    sag(0);
+    sub(0); frame("sub 0: a plain dish");
+    CHECK(vis_spokes == 0 && !vis_whitewall && !vis_spinner, "sub 0: no spokes, no whitewall, no spinner");
+    sub(9830); frame("sub 30 %: spokes growing");
+    CHECK(vis_spokes >= 10 && vis_spokes <= 14 && !vis_whitewall, "sub 30 %%: %d spokes, no whitewall yet", vis_spokes);
+    sub(21000); frame("sub 64 %: whitewall");
+    CHECK(vis_whitewall && !vis_spinner, "sub 64 %%: %d spokes and the whitewall", vis_spokes);
+    sub(32767); frame("sub full: lowrider");
+    int gold = 0; for (int j = 0; j < nlines; j++) if (lines[j].c[0] == 0xFF && lines[j].c[1] == 0xC8) gold++;
+    CHECK(vis_spokes == 40 && vis_whitewall && vis_spinner && gold >= 10, "sub full: 40 spokes, whitewall, gold spinner (%d gold lines)", gold);
+    sag(32767); frame("lowrider, flat"); sag(0);
+    /* a note: bounce and spin, with everything at its largest */
+    sub(32767); sag(32767);
     vis_trig++; vis_lvl = 32767; vis_inc = (uint32_t)(55 / 88200.0 * 4294967296.0);
-    map(0, TY_HUB_X, TY_HUB_Y + TY_R_TYRE, &x, &y); const double rest = y;
-    double top = 1e9; uint32_t a0 = ang; int under = 0, offscreen = 0;
+    const int32_t rest = vis_hub_y;
+    int32_t top = rest; uint32_t a0 = ang; int offscreen = 0, shadow = 0;
     for (int i = 0; i < 90; i++) {
         frame(i == 6 ? "note on: bounce" : i == 30 ? "rolling" : "rolling on");
-        map(0, TY_HUB_X, TY_HUB_Y + TY_R_TYRE, &x, &y); if (y < top) top = y; if (y > TY_GROUND_Y) under = 1;
-        map(0, TY_HUB_X, TY_HUB_Y - TY_R_TYRE - TY_TREAD_H, &x, &y); if (y + 0.94 * TY_WY < 2) offscreen = 1;
-        for (int j = 0; j < nlines; j++) if (lines[j].y1 > OP1_Q10(148) || lines[j].y0 > OP1_Q10(148) || lines[j].x0 < 0 || lines[j].x1 > OP1_Q10(320) || lines[j].y0 < OP1_Q10(2) || lines[j].y1 < OP1_Q10(2)) offscreen = 1;
+        if (vis_hub_y < top) top = vis_hub_y;
+        if (i == 6) for (int j = 0; j < nlines; j++) shadow += lines[j].c[0] == 0x6F && lines[j].y0 > OP1_Q10(115);
+        for (int j = 0; j < nlines; j++) if (lines[j].y1 > OP1_Q10(150) || lines[j].y0 > OP1_Q10(150) || lines[j].x0 < OP1_Q10(2) || lines[j].x1 < OP1_Q10(2) || lines[j].x0 > OP1_Q10(318) || lines[j].x1 > OP1_Q10(318) || lines[j].y0 < OP1_Q10(2) || lines[j].y1 < OP1_Q10(2)) offscreen = 1;
+        for (int q = 0; q < npolys; q++) for (int j = 0; j < polys[q].n; j++) if (polys[q].p[j].y > OP1_Q10(150) || polys[q].p[j].y < OP1_Q10(2) || polys[q].p[j].x < OP1_Q10(2) || polys[q].p[j].x > OP1_Q10(318)) offscreen = 1;
     }
-    CHECK(rest - top > 5, "a note kicks the wheel off the ground (%.1f px)", rest - top);
-    CHECK(!under && !offscreen, "nothing goes through the ground or off the screen");
+    CHECK((rest - top) / 1024.0 > 5, "a note kicks the wheel off the road (%.1f px)", (rest - top) / 1024.0);
+    CHECK(shadow >= 2, "and its shadow stays on the road");
+    CHECK(!offscreen, "nothing goes off the screen or below its lower margin, at the largest size, flat, lowrider, bouncing");
     CHECK(ang != a0, "the wheel turns while a note sounds");
     vis_lvl = 0; for (int i = 0; i < 400; i++) frame("coasting");
     a0 = ang; frame("stopped");
     CHECK(ang == a0, "and stops after it");
-    host_shift_held = 1; host_knobs[0][5] = 16384; host_knobs[0][7] = 64 | 127 << 8; frame("shift held: gauges show drive, clip, sustain, glide");
+    sub(0); sag(0);
+    host_shift_held = 1; host_knobs[0][5] = 16384; host_knobs[0][7] = 32767; sub(32767); sag(32767); glide_rec(32767); frame("shift held: drive, knock length, sub, glide");
     /* text strokes are the 1 px lines; everything else the screen draws is 1.5 px */
 #define TEXT_SCAN(cnt, bad, cor) do { cnt = bad = 0; memset(cor, 0, sizeof cor); for (int j = 0; j < nlines; j++) if (lines[j].w == 1024) { \
         const int32_t xa = lines[j].x0 < lines[j].x1 ? lines[j].x0 : lines[j].x1, xb = lines[j].x0 > lines[j].x1 ? lines[j].x0 : lines[j].x1; \
-        cnt++; if ((xb > OP1_Q10(95) && xa < OP1_Q10(225)) || xa < OP1_Q10(6) || xb > OP1_Q10(314)) bad++; \
+        cnt++; if (on_tyre(lines[j].x0, lines[j].y0, lines[j].x1, lines[j].y1) || xa < OP1_Q10(6) || xb > OP1_Q10(314)) bad++; \
         cor[(lines[j].y0 > OP1_Q10(80)) * 2 + (xa > OP1_Q10(160))]++; } } while (0)
 #define TEXT_HASH(h) do { h = 0; for (int j = 0; j < nlines; j++) if (lines[j].w == 1024) h = h * 31 + (unsigned)(lines[j].x0 + 7 * lines[j].y0 + 13 * lines[j].x1 + 17 * lines[j].y1); } while (0)
     int txt, txt2, bad, bad2, cor[4], cor2[4]; unsigned h1, h2;
@@ -483,20 +620,37 @@ int main(int argc, char **argv)
     TEXT_SCAN(txt2, bad2, cor2); TEXT_HASH(h2);
     CHECK(txt > 60 && txt2 > 60 && h1 != h2, "labels are drawn, and Shift shows the second set (%d and %d strokes)", txt2, txt);
     CHECK(cor2[0] > 8 && cor2[1] > 8 && cor2[2] > 8 && cor2[3] > 8, "one label block in each corner (%d, %d, %d, %d strokes)", cor2[0], cor2[1], cor2[2], cor2[3]);
-    CHECK(!bad && !bad2, "labels stay in their corners, clear of the wheel and the screen edge");
+    CHECK(!bad && !bad2, "labels stay in their corners, clear of the tyre (largest, flat), the road and the screen edge");
     mode(MODE_RETRIG); frame("mode: mono retrig"); TEXT_SCAN(txt2, bad2, cor2); mode(MODE_GLIDE);
     CHECK(!bad2, "the longest mode name fits");
-    alt[0] = alt[1] = alt[2] = 1; third(32, 16, ALT_MAX); frame("pushed: sub, tone, attack"); int txt3, bad3, cor3[4]; TEXT_SCAN(txt3, bad3, cor3);
-    CHECK(!bad3 && txt3 != txt2, "pushed encoders show their third value, and the longest fits");
-    alt[2] = 2; sag(32); frame("pushed twice: sag"); memset((void *)alt, 0, sizeof alt); third(0, 0, 0); sag(0);
+    host_shift_held = 1; blue_clip = 1; frame("shift held, blue on clip"); int txt3, bad3, cor3[4]; TEXT_SCAN(txt3, bad3, cor3);
+    CHECK(!bad3 && txt3 != txt, "Shift with blue switched shows clip, and fits (%d strokes)", txt3);
+    blue_clip = 0; host_shift_held = 0; sub(0); sag(0);
     host_knobs[0][0] = 0; frame("shape at -50 %"); TEXT_SCAN(txt3, bad3, cor3);
     CHECK(!bad3, "the shape value fits with its sign");
     host_knobs[0][0] = 8192;
-    host_knobs[0][2] = 32767; frame("knock length in seconds"); TEXT_SCAN(txt3, bad3, cor3);
-    CHECK(!bad3, "the longest knock length fits its corner");
+    host_knobs[0][2] = 32767; sag(32767); host_shift_held = 1; glide_rec(32767); frame("shift held, glide 500 ms"); host_shift_held = 0; frame("tone open, sag 100 %"); TEXT_SCAN(txt3, bad3, cor3); CHECK(!bad3, "the longest tone and sag values fit"); host_shift_held = 1; frame("shift held, glide 500 ms"); TEXT_SCAN(txt3, bad3, cor3);
+    CHECK(!bad3, "the longest tone and glide values fit their corners");
     host_shift_held = 0;
+
+    /* the T2 page: the envelope curve and four labels */
+#define T2_FRAME(label) frame_of(&SCREEN_tyr8_t2, label)
+    host_t2[0][0] = t2_of(0.2); host_t2[0][1] = t2_of(0.5); host_t2[0][2] = 16384; host_t2[0][3] = t2_of(0.5);
+    T2_FRAME("T2: attack, decay, sustain half, release");
+    int curve = 0, outside = 0; for (int j = 0; j < nlines; j++) { if (lines[j].w != 1024) curve++;
+        if (lines[j].x0 < 0 || lines[j].x1 > OP1_Q10(316) || lines[j].y0 < 0 || lines[j].y1 > OP1_Q10(140)) outside++; }
+    TEXT_SCAN(txt3, bad3, cor3); unsigned h3; TEXT_HASH(h3);
+    CHECK(curve > 30 && !outside, "T2 draws the envelope curve on screen (%d lines)", curve);
+    CHECK(cor3[0] > 8 && cor3[1] > 8 && cor3[2] > 8 && cor3[3] > 8 && !bad3, "T2: a label in each corner, clear of the middle");
+    host_t2[0][3] = T2_HI; host_t2[0][0] = T2_HI; host_t2[0][1] = T2_HI; host_t2[0][2] = 32767; T2_FRAME("T2: all up, release HOLD");
+    unsigned h4; TEXT_HASH(h4); TEXT_SCAN(txt3, bad3, cor3);
+    CHECK(h4 != h3 && !bad3, "T2: HOLD and the longest values fit");
+    host_t2[0][0] = T2_LO; host_t2[0][1] = T2_LO; host_t2[0][2] = 0; host_t2[0][3] = T2_LO; T2_FRAME("T2: all down");
+    TEXT_SCAN(txt3, bad3, cor3);
+    CHECK(!bad3, "T2: the shortest values fit");
     if (fj) { fprintf(fj, "]\n"); fclose(fj); }
 
+    printf("audio hash %08x\n", audio_hash);
     printf(fails ? "\n%d FAILED\n" : "\nall ok\n", fails);
     return fails != 0;
 }
