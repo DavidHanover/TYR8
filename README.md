@@ -3,6 +3,7 @@
 An 808 bass synth for the original Teenage Engineering OP-1 running the
 [Hundekraft](https://hundekraft.github.io/op1-workshop/) custom firmware. It is one plugin file, `tyr8.knl`,
 installed through the Hundekraft workshop.
+If you enjoy this, toss me some [cheddar](https://buymeacoffee.com/davidhanover)!!
 
 ![TYR8 screen](docs/screen.png)
 
