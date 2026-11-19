@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.21
+- Fixed: kicked hard (full knock, or notes landing while it is still in the air), a big blown-up tyre bounced into the
+  labels, and lines it drew there stuck (the labels are a still layer). The tyre's top now stops at 24 px, as high as
+  the largest round tyre's highest kick goes.
+- Fixed: fully blown up, the sidewall's red strain line could run off the tyre; the outline now takes in the
+  ballooning wall. And on a fully flat tyre the valve poked out under it once a turn; it squashes with the flat.
+
 ## 0.9.20
 - README: set the OP-1's own play mode (Shift + T2) to poly or mono, not unison. Unison was behind the clicks on
   every note and the missing retrigger knock found on hardware; a slot keeps the play mode of its previous sound.

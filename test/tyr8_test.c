@@ -809,6 +809,33 @@ int main(int argc, char **argv)
     CHECK(!offscreen, "nothing goes off the screen or below its lower margin, at the largest size, flat or blown up, lowrider, bouncing");
     host_knobs[0][1] = 32767; for (int i = 0; i < 40; i++) { frame("rough road, rolling"); escapes += dyn_escapes(); } host_knobs[0][1] = 20000;
     CHECK(escapes == 0 && dyn_from > 0, "no moving stroke or fill reaches the still label layer (%d escapes)", escapes);
+    { /* every size, slick and lugs, flat, round and blown up, knock 0 and full, kicked off the road again and again:
+       * nothing reaches the label layer, and the red strain line stays on the tyre */
+      const int16_t d0 = host_t2[0][1], c6 = host_knobs[0][6], k1 = host_knobs[0][1];
+      int esc = 0, off = 0, worst_sz = -1;
+      for (int sz = 0; sz < 3; sz++) for (int lug = 0; lug < 2; lug++) for (int sg = 0; sg < 3; sg++) for (int kn = 0; kn < 2; kn++) {
+          host_t2[0][1] = t2_of(sz * 0.5); host_knobs[0][6] = lug ? 32767 : 0; host_knobs[0][5] = 0;
+          sag(sg == 0 ? 32767 : 0); rise(sg == 2 ? 32767 : 0); host_knobs[0][1] = kn ? 32767 : 0;
+          vis_lvl = 32767; vis_inc = (uint32_t)(55 / 88200.0 * 4294967296.0);
+          for (int i = 0; i < 150; i++) {
+              if (i % 30 == 0) vis_trig++;
+              frame("stress: bouncing");
+              const int e = dyn_escapes(); esc += e; if (e && worst_sz < 0) worst_sz = sz * 100 + lug * 10 + sg;
+              if (getenv("TY_STRESS")) printf("stress top sz %d lug %d sag %d knock %d esc %d top %.1f\n", sz, lug, sg, kn, e, (vis_hub_y - last_wheel.rout - last_wheel.inf - last_wheel.bl) / 1024.0);
+              if (e && getenv("TY_STRESS")) printf("stress esc sz %d lug %d sag %d knock %d frame %d: %d\n", sz, lug, sg, kn, i, e);
+              for (int q = dyn_from; q < nops; q++) { if (ops[q] < 0) continue; const hline *l = &lines[ops[q]];   /* the moving layer */
+                  int in0 = 0, in1 = 0;                          /* within 0.75 px of the outline (its stroke is 1.5) */
+                  for (int d = 0; d < 9; d++) { const double ox = (d % 3 - 1) * 768.0, oy = (d / 3 - 1) * 768.0;
+                      in0 |= in_convex(sil, sil_n, l->x0 + ox, l->y0 + oy); in1 |= in_convex(sil, sil_n, l->x1 + ox, l->y1 + oy); }
+                  if (l->c[0] == 0xFF && l->c[1] == 0x3A && (!in0 || !in1)) {
+                      if (getenv("TY_STRESS") && off < 8) printf("stress off sz %d lug %d sag %d kn %d: (%.1f,%.1f)-(%.1f,%.1f) w %d hub (%.1f,%.1f)\n", sz, lug, sg, kn, l->x0/1024.0, l->y0/1024.0, l->x1/1024.0, l->y1/1024.0, l->w, last_wheel.hx/1024.0, last_wheel.hy/1024.0);
+                      off++; } }
+          }
+      }
+      CHECK(esc == 0, "bouncing at every size, flat to blown up, knock 0 and full: nothing reaches the labels (%d escapes, first at size/lugs/sag %d)", esc, worst_sz);
+      CHECK(off == 0, "and nothing red on the tyre (the strain line, the valve) leaves its outline, flat or blown up (%d strokes off it)", off);
+      vis_lvl = 0; for (int i = 0; i < 400; i++) frame("coasting");
+      host_t2[0][1] = d0; host_knobs[0][6] = c6; host_knobs[0][1] = k1; sag(32767); rise(0); }
     CHECK(ang != a0, "the wheel turns while a note sounds");
     vis_lvl = 0; for (int i = 0; i < 400; i++) frame("coasting");
     a0 = ang; frame("stopped");

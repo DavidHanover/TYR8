@@ -1215,11 +1215,18 @@ static int nn, fn;
 static void wheel_prep(const wheel_t *w, int32_t sp)
 {
     const int32_t a0 = -sp;
-    op1_pt all[LUG_N * 5];
+    op1_pt all[LUG_N * 5 + 24];
     nn = outline(w, a0, 0, nf); fn = outline(w, a0, 1, ff);
     for (int i = 0; i < nn; i++) all[i] = nf[i];
     for (int i = 0; i < fn; i++) all[nn + i] = ff[i];
-    sil_n = hull(all, nn + fn, sil);
+    int na = nn + fn;
+    if (w->inf) {                         /* blown up, the wall balloons past the tread's edge: the outline takes it in, */
+        const int32_t rw = w->rc - (w->rc - w->rrim) / 4;      /* as far out as the line drawn on it, at its */
+        int n = 6 + (rw >> 11);                                /* points (ring's segments) */
+        n = n < 10 ? 10 : (n > 24 ? 24 : n);
+        for (int i = 0; i < n; i++) all[na++] = wp(w, 8192 * i / n, rw, 0);
+    }
+    sil_n = hull(all, na, sil);
     int64_t area = 0;
     for (int i = 0, j = sil_n - 1; i < sil_n; j = i++) area += (int64_t)sil[j].x * sil[i].y - (int64_t)sil[i].x * sil[j].y;
     cull_sg = area > 0 ? 1 : -1;
@@ -1295,7 +1302,9 @@ static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
             ln(r, c.x, c.y - 1024, c.x, c.y + 1024, COL_KNOB[0]);
         }
     }
-    lnp(r, wp(&rg, a0 + 600, w->rrim + OP1_Q10(1), 0), wp(&rg, a0 + 600, w->rrim + OP1_Q10(5), 0), COL_KNOB[3]);   /* valve */
+    wheel_t vt = *w;                                           /* valve: its tip in the rubber, squashed with a flat (it */
+    vt.inf = 0; vt.bl = 0;                                     /* poked out under it), not stretched by the blowing up */
+    lnp(r, wp(&rg, a0 + 600, w->rrim + OP1_Q10(1), 0), wp(&vt, a0 + 600, w->rrim + OP1_Q10(5), 0), COL_KNOB[3]);
 }
 
 /* one block a corner, each encoder in its colour (blue and green on top, white and orange below): name, value and a
@@ -1392,9 +1401,14 @@ static void ty_screen_update(void *scr, int dt)
         const int32_t h = bump(tick, amt);
         if (h > 0 && by == 0 && bv == 0 && run > 64) bv = -OP1_Q10(18) * h;   /* not over a note's kick */
     }
+    /* the ceiling: the tyre's top no higher than 24 px, as high as the largest round tyre's highest kick goes. A big
+     * blown-up tyre kicked hard, or kicks that land while it is still up (fast notes), would carry it into the labels,
+     * whose still layer then keeps what it drew there */
+    const int32_t by_min = OP1_Q10(24) + (wh.rout + wh.inf + wh.bl) + (wh.rout - wh.q + wh.inf) - OP1_Q10(CON_Y);
     for (int i = 0; i < dt; i++) {                                           /* one step a millisecond */
         bv += 922;                                                           /* 900 px / s^2 */
         by += bv / 1000;
+        if (by < by_min) { by = by_min; if (bv < 0) bv = 0; }
         if (by >= 0) {
             by = 0;
             bv = -(bv * 45) / 100;
