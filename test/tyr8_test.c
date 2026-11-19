@@ -491,6 +491,11 @@ int main(int argc, char **argv)
       tone(32767);
       CHECK(de / e < de2 / e2 / 1.3 && de3 / e3 < de / e / 1.5, "tone, default drive: half open has 1/%.2f of the open treble, a quarter 1/%.2f (the whole turn is heard)", (de2 / e2) / (de / e), (de2 / e2) / (de3 / e3)); }
 
+    /* 12a. a new sound (no record): MONO GLIDE, sub 0, glide in the middle (250 ms), no rise */
+    { const uint32_t ow = host_eng_rec_owner[0]; host_eng_rec_owner[0] = 0; int16_t r[REC_N]; rec_get(0, r);
+      CHECK(r[REC_MODE] == MODE_GLIDE && r[REC_SUB] == 0 && r[REC_GLIDE] == 16384 && r[REC_RISE] == 0, "a new sound: MONO GLIDE, sub 0, glide 250 ms (%d), no rise", r[REC_GLIDE]);
+      host_eng_rec_owner[0] = ow; }
+
     /* 12b. the input hook: a plain turn is the OP-1's, every Shift + turn is TYR8's */
     host_slot = 0; host_shift_held = 0; blue_clip = 0; memset(host_eng_rec[0], 0, sizeof host_eng_rec[0]); mode(MODE_GLIDE);
     memset(host_knobs, 0, sizeof host_knobs); host_knobs[0][5] = 14000; host_knobs[0][6] = 12000; host_knobs[0][7] = 4500;
@@ -824,9 +829,9 @@ int main(int argc, char **argv)
               if (getenv("TY_STRESS")) printf("stress top sz %d lug %d sag %d knock %d esc %d top %.1f\n", sz, lug, sg, kn, e, (vis_hub_y - last_wheel.rout - last_wheel.inf - last_wheel.bl) / 1024.0);
               if (e && getenv("TY_STRESS")) printf("stress esc sz %d lug %d sag %d knock %d frame %d: %d\n", sz, lug, sg, kn, i, e);
               for (int q = dyn_from; q < nops; q++) { if (ops[q] < 0) continue; const hline *l = &lines[ops[q]];   /* the moving layer */
-                  int in0 = 0, in1 = 0;                          /* within 0.75 px of the outline (its stroke is 1.5) */
-                  for (int d = 0; d < 9; d++) { const double ox = (d % 3 - 1) * 768.0, oy = (d / 3 - 1) * 768.0;
-                      in0 |= in_convex(sil, sil_n, l->x0 + ox, l->y0 + oy); in1 |= in_convex(sil, sil_n, l->x1 + ox, l->y1 + oy); }
+                  int in0 = 1, in1 = 1;                          /* the whole stroke inside the outline: every point */
+                  for (int d = 0; d < 9; d++) { const double ox = (d % 3 - 1) * l->w / 2.0, oy = (d / 3 - 1) * l->w / 2.0;   /* half its width round */
+                      in0 &= in_convex(sil, sil_n, l->x0 + ox, l->y0 + oy); in1 &= in_convex(sil, sil_n, l->x1 + ox, l->y1 + oy); }
                   if (l->c[0] == 0xFF && l->c[1] == 0x3A && (!in0 || !in1)) {
                       if (getenv("TY_STRESS") && off < 8) printf("stress off sz %d lug %d sag %d kn %d: (%.1f,%.1f)-(%.1f,%.1f) w %d hub (%.1f,%.1f)\n", sz, lug, sg, kn, l->x0/1024.0, l->y0/1024.0, l->x1/1024.0, l->y1/1024.0, l->w, last_wheel.hx/1024.0, last_wheel.hy/1024.0);
                       off++; } }

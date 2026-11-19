@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.23
+- Fixed: on a blown-up slick the red strain line still stuck out of the tyre by half its width (the outline ran
+  through its middle). The outline now takes it in with 2 px to spare, and a flat's valve tip stays 2 px inside.
+
+## 0.9.22
+- A new TYR8 starts plain: shape 0 % (a sine), knock 0, knock length at its shortest, tone open, sag 0, drive 0, clip
+  0, sub 0, MONO GLIDE with the glide in the middle (250 ms). Saved sounds keep their settings.
+
 ## 0.9.21
 - Fixed: kicked hard (full knock, or notes landing while it is still in the air), a big blown-up tyre bounced into the
   labels, and lines it drew there stuck (the labels are a still layer). The tyre's top now stops at 24 px, as high as

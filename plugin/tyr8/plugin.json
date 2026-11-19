@@ -9,14 +9,14 @@
   ],
   "defaults": [
     8192,
-    12000,
+    0,
     32767,
     0
   ],
   "page2_defaults": [
-    14000,
-    12000,
-    4500
+    0,
+    0,
+    0
   ],
   "own_envelope": true,
   "t2_page": true,
@@ -27,5 +27,5 @@
   },
   "claims": [],
   "author": "David Hanover",
-  "version": "0.9.21"
+  "version": "0.9.23"
 }

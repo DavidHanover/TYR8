@@ -219,8 +219,9 @@ Since 0.9.4 there are no push pages. The layout was the owner's own design (2026
   at the release rate, or at the decay rate with `HOLD`. Sustain 0 + `HOLD` is the 808 one-shot.
 - **Record layout** (`REC_*`): `[0]` mode, `[5]` sub, `[6]` glide, `[7]` sag's rise (0.9.13), each 0..32767. `[1]..[4]` held 0.9.3's push-page
   values and are ignored.
-- **Defaults** (`plugin.json`): words `[8192, 12000, 32767, 0]` and page-2 `[14000, 12000, 4500]`: plain sine, a
-  medium knock, tone open, no glide, drive 43 %, clip 37 %, knock length about 36 ms.
+- **Defaults** (`plugin.json`, from 0.9.22): words `[8192, 0, 32767, 0]` and page-2 `[0, 0, 0]`: plain sine, no
+  knock, tone open, no sag, drive 0, clip 0, knock length at its shortest (20 ms). With no record yet (`rec_get`, `!r`)
+  the mode is MONO GLIDE, sub 0 and glide 16384 (250 ms, the middle).
 - **Tone law:** 12 kHz down 6.4 octaves to 140 Hz by `closed * (2 - closed)`. When it was linear in octaves, the
   top half of the knob was inaudible on a driven bass, because the clipper after the tone puts treble back.
 

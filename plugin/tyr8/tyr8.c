@@ -82,6 +82,7 @@ static void rec_get(int slot, int16_t out[REC_N])
     const int16_t *r = op1_engine_record(slot, rec_key);
     out[REC_MODE] = r && r[0] > 0 && r[0] < MODE_N ? r[0] : MODE_GLIDE;
     for (int i = 1; i < REC_N; i++) out[i] = !r || r[i] < 0 ? 0 : r[i];
+    if (!r) out[REC_GLIDE] = 16384;           /* a new sound (no record yet): glide in the middle, 250 ms */
 }
 static int mode_of(int slot) { int16_t r[REC_N]; rec_get(slot, r); return r[REC_MODE]; }
 
@@ -1224,7 +1225,8 @@ static void wheel_prep(const wheel_t *w, int32_t sp)
         const int32_t rw = w->rc - (w->rc - w->rrim) / 4;      /* as far out as the line drawn on it, at its */
         int n = 6 + (rw >> 11);                                /* points (ring's segments) */
         n = n < 10 ? 10 : (n > 24 ? 24 : n);
-        for (int i = 0; i < n; i++) all[na++] = wp(w, 8192 * i / n, rw, 0);
+        for (int i = 0; i < n; i++) all[na++] = wp(w, 8192 * i / n, rw + OP1_Q10(2), 0);   /* 2 px out: the line's */
+                                                                                          /* whole stroke inside it */
     }
     sil_n = hull(all, na, sil);
     int64_t area = 0;
@@ -1304,6 +1306,7 @@ static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
     }
     wheel_t vt = *w;                                           /* valve: its tip in the rubber, squashed with a flat (it */
     vt.inf = 0; vt.bl = 0;                                     /* poked out under it), not stretched by the blowing up */
+    if (vt.q) vt.q += OP1_Q10(2);                              /* and its tip 2 px above the flat, its stroke inside */
     lnp(r, wp(&rg, a0 + 600, w->rrim + OP1_Q10(1), 0), wp(&vt, a0 + 600, w->rrim + OP1_Q10(5), 0), COL_KNOB[3]);
 }
 
