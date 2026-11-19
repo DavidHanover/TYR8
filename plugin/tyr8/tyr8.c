@@ -4,8 +4,11 @@
  *   blue   shape, see render                  drive, up to 30 dB (word 5) or clip, soft .. hard (word 6):
  *                                               Shift + blue push switches which one
  *   green  pitch envelope amount (knock)       knock length, 20 ms .. 1.5 s                     (word 7)
- *   white  tone: low-pass after the drive      sub: clean sine under the drive                  (record)
- *   orange sag: the pitch falls while the note lasts   glide time, 0 .. 500 ms (record)
+ *   white  tone: low-pass after the drive      sub: a clean sine an octave down (at the note's own   (record)
+ *                                               pitch where that would be under ~40 Hz), up to all of it
+ *   orange sag, -100 .. 100 %: the pitch falls (up)    glide time, 0 .. 500 ms (record)
+ *          or rises (down) while the note lasts; the turn is taken here (ty_input): the fall is word 3, the rise the
+ *          record's [7], so a sound saved before 0.9.13 keeps its fall
  *   an orange push, with or without Shift, steps the play mode (record)
  *
  *   T2     the OP-1's own envelope words (t2_page), drawn by the engine's T2 page:
@@ -38,12 +41,18 @@
 #include "seq/seq_text.h"                     /* sq_text: the core's stroke font (uppercase, digits, . % : + - / #) */
 
 #define ONE30       (1 << 30)                 /* envelope full scale */
+#define ONE29       (1 << 29)                 /* the sag factor's 1.0 */
 #define SILENT      (ONE30 >> 17)             /* -102 dB: the note is over (the drive can lift a tail 30 dB) */
 #define Q18_ONE     (1 << 18)                 /* the signal path's 1.0 */
 #define Q18_LIM     (3 << 17)                 /* and its 1.5, where the saturations go flat */
 #define AUDIBLE     (ONE30 >> 7)              /* -42 dB: below this a held note no longer makes the next one legato */
 #define OCT_DOWN    2                         /* the engine plays this many octaves below the key: bass at octave 0 */
-#define OUT_GAIN    32767                     /* full scale: one voice, so nothing adds on top of it */
+#define OUT_GAIN    20675                     /* -4 dB: the synth bus's 35 Hz high-pass after the voices tilts a full-scale
+                                               * square-ish note and throws its edges and onset up to 6 dB over (measured
+                                               * on the driven patches, 2nd order); at full scale the OP-1 clipped every
+                                               * note (red, a click). Up to 0.9.16 it was 32767; 0.9.17 .. 0.9.19 -6.5 dB,
+                                               * which the owner found too quiet. An ordinary note stays inside; the
+                                               * heaviest patches go up to ~2 dB over */
 #define FADE_LSB    96                        /* the tail's last fade starts below this output peak (-51 dBFS) */
 
 /* ---- keys (key thread writes, audio reads) ---- */
@@ -51,16 +60,18 @@ static volatile uint8_t  held[OP1_VOICES];    /* the voice's key is down */
 static volatile uint8_t  legato_req[OP1_VOICES]; /* its note-on came while another key was down */
 static volatile uint32_t stamp[OP1_VOICES];   /* note-on order: the newest held voice plays */
 static volatile uint32_t beat[OP1_VOICES];    /* render call count when the voice last rendered: is it still alive */
+static volatile uint32_t on_at[OP1_VOICES];   /* render call count at its note-on: voices on at the same count are one press */
 static volatile uint32_t stamp_next = 1, calls;
 static volatile int8_t   owner = -1;          /* the voice that sounds */
 
 /* ---- the engine's record, saved with the sound: values the eight words have no room for. 0 is each one's default ----
  *   [0] play mode (the orange push steps it)
- *   [5] sub: clean sine under the drive, 0 .. 32767 (Shift + white)
- *   [6] sag: how far the pitch falls while the note lasts, 0 .. 32767 (Shift + orange)
+ *   [5] sub: the clean sine's share, 0 .. 32767 (Shift + white)
+ *   [6] glide time, 0 .. 32767 (Shift + orange)
+ *   [7] sag's rise: how far the pitch rises while the note lasts, 0 .. 32767 (orange turned below 0; the fall is word 3)
  * [1] .. [4] held the push pages' values up to 0.9.3 and are not read. */
 enum { MODE_GLIDE, MODE_RETRIG, MODE_N };
-enum { REC_MODE = 0, REC_SUB = 5, REC_GLIDE = 6, REC_N };
+enum { REC_MODE = 0, REC_SUB = 5, REC_GLIDE = 6, REC_RISE = 7, REC_N };
 #define TY_NAME "tyr8"
 static uint32_t rec_key;                      /* the record's owner key, worked out once */
 static volatile uint8_t blue_clip;            /* Shift + blue turns clip (1) or drive (0); Shift + blue push switches.
@@ -115,8 +126,10 @@ typedef struct {
     uint8_t  pkn;                             /* blocks into that window */
     int32_t  z1, z2;                          /* tone: the two low-pass states, Q18 */
     int32_t  f1, f2;                          /* feedback: the last two output samples */
-    int32_t  sag;                             /* pitch sag: the note's frequency factor, ONE30 falling */
+    int32_t  sag;                             /* pitch sag: the note's frequency factor, Q29 (ONE29 = 1): 1/8 .. 2 */
     uint8_t  restart;                         /* this block starts a note: 1 from silence, 2 over a sounding one */
+    uint8_t  ph_h;                            /* the phase's 33rd bit: the octave-down sub's phase is (ph_h ph) / 2 */
+    int32_t  ow;                              /* the sub's octave-down share, Q12: 0 at the note's own pitch */
     uint8_t  live;                            /* the envelope has not run out (0 at boot: nothing sounds) */
 } voice_t;
 static voice_t tv[OP1_VOICES];
@@ -167,9 +180,14 @@ static void ty_note_on(void *self, const int16_t *params)
 {
     const int v = op1_voice_index(self); (void)params;
     if (v < 0 || v >= OP1_VOICES) return;
+    /* legato over another key still down, pressed before this one: not over a voice the OP-1 started for the same
+     * press (unison starts several before the next render). Up to 0.9.15 the second voice of a press was legato over
+     * the first, so with unison no note restarted (no knock) until the last tail had died away */
+    const uint32_t now = calls;
     int other = 0;
-    for (int i = 0; i < OP1_VOICES; i++) if (i != v && held[i] && alive(i)) other = 1;
+    for (int i = 0; i < OP1_VOICES; i++) if (i != v && held[i] && alive(i) && on_at[i] != now) other = 1;
     legato_req[v] = (uint8_t)other;
+    on_at[v] = now;
     held[v] = 1;
     beat[v] = calls;
     stamp[v] = stamp_next++;
@@ -212,20 +230,23 @@ enum { F_TONE = 1, F_SUB = 2, F_FB = 4, F_MOD = 8 };
 typedef struct {
     const int32_t *inc;
     const int16_t *tab;
-    uint32_t dq;
+    int32_t dq, csh;
     int32_t dm, dg, dgg, da, o, sh_tri, sh_saw, fb, bk, mix, cpl, lift, g2, clip, cg, tc, sub, og;
     int32_t m, g, gg, av;                     /* where the ramps start */
+    int32_t ow, dow;                          /* the sub's octave share, Q12 << 7, and its ramp a sample */
 } blk_t;
 
 static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t *out, const blk_t *k, const int F)
 {
     const int32_t *const inc = k->inc;
     const int16_t *const tab = k->tab;
-    const uint32_t dq = k->dq;
+    const int32_t dq = k->dq, csh = k->csh;
     const int32_t dm = k->dm, dg = k->dg, dgg = k->dgg, da = k->da, o = k->o, sh_tri = k->sh_tri, sh_saw = k->sh_saw;
     const int32_t fb = k->fb, bk = k->bk, mix = k->mix, cpl = k->cpl, lift = k->lift, g2 = k->g2, clip = k->clip;
     const int32_t cg = k->cg, tc = k->tc, sub = k->sub, og = k->og;
-    uint32_t p = t->ph;
+    uint32_t p = t->ph, ph = t->ph_h;
+    int32_t ow = k->ow;
+    const int32_t dow = k->dow;
     int32_t m = k->m, g = k->g, gg = k->gg, av = k->av, lp = t->hp, dc = t->dcs, tl = t->tail, y = 0;
     int32_t z1 = t->z1, z2 = t->z2, f1 = t->f1, f2 = t->f2, pre = 0;
     int rs = t->restart;
@@ -234,13 +255,15 @@ static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t 
         if (F & F_MOD) i += o;
         if (i < 0) i = 0;
         if (F & F_MOD) {
-            uint32_t ic = (uint32_t)i >> 12;                   /* sag: take off the part the pitch has fallen */
-            if (ic > 32767) ic = 32767;
-            i -= (int32_t)((ic * dq) >> 4);
+            int32_t ic = i >> 12;                              /* sag: take off the part the pitch has fallen */
+            if (ic > 32767) ic = 32767;                        /* (dq < 0: add the part it has risen) */
+            i -= (ic * dq) >> 3;
         }
         uint32_t ib = (uint32_t)i >> 13;
         if (ib > 16383) ib = 16383;
+        const uint32_t pp = p;
         p += (uint32_t)i + ib * (uint32_t)(m >> 8);           /* note + glide + pitch envelope */
+        if (F & F_SUB) ph ^= p < pp;                           /* a cycle wrapped: the octave-down phase's top bit */
         m += dm;
 
         const uint32_t q = F & F_FB ? p + ((uint32_t)(((f1 + f2) >> 1) * fb) << 1) : p;   /* feedback: the phase the waves are read at */
@@ -255,7 +278,8 @@ static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t 
         /* From here the signal is Q18 (1.0 = 262144), eight times finer than the 16 bits it leaves in: the drive
          * amplifies a dying tail by up to 30 dB, and what the tail is rounded to here is the noise heard on it.
          * A product must stay inside 32 bits, so the gains give up the bits the signal takes (Q8, Q11, Q12). */
-        /* the sub: a sine at the note's own phase (p, not q: feedback does not bend it) at the envelope's level */
+        /* the sub: a sine an octave down (half the phase, from p, not q: feedback does not bend it), crossfaded to the
+         * note's own phase by ow, at the envelope's level */
         int32_t clean = 0;
         if (F & F_SUB) {
             int32_t sc = sn;
@@ -263,6 +287,13 @@ static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t 
                 const int32_t kc = (int32_t)(p >> 19), c0 = op1_sin_q(tab, kc);
                 sc = c0 + (((op1_sin_q(tab, kc + 1) - c0) * (int32_t)((p >> 4) & 0x7FFF)) >> 15);
             }
+            if (ow) {                                          /* (an exact 0 only when it stays 0: dow then too) */
+                const uint32_t po = (ph << 31) | (p >> 1);
+                const int32_t ko = (int32_t)(po >> 19), o0 = op1_sin_q(tab, ko);
+                const int32_t so = o0 + (((op1_sin_q(tab, ko + 1) - o0) * (int32_t)((po >> 4) & 0x7FFF)) >> 15);
+                sc += ((so - sc) * (ow >> 7)) >> 12;
+            }
+            ow += dow;
             clean = ((sc * (g >> 15)) >> 12) + ((sc * ((g >> 8) & 127)) >> 19);
             g += dg;
         }
@@ -297,7 +328,7 @@ static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t 
             f2 = f1;
             f1 = (ft - cube18(ft)) >> 3;
         }
-        x = (x * cg) >> 10;                                    /* the clipper, last */
+        x = (x * cg) >> csh;                                   /* the clipper, last */
         const int32_t xc = x > Q18_LIM ? Q18_LIM : (x < -Q18_LIM ? -Q18_LIM : x);
         const int32_t ys = xc - cube18(xc);
         const int32_t yh = x > Q18_ONE - 8 ? Q18_ONE - 8 : (x < 8 - Q18_ONE ? 8 - Q18_ONE : x);   /* hard: brick wall at +-1 */
@@ -311,11 +342,14 @@ static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t 
         if (rs) { tl = (t->last_y - y) * 256; rs = 0; }        /* a new note carries on from the last sample: no click */
         y += tl >> 8;                                          /* and that offset fades in 1.5 ms */
         tl -= tl >> 7;
+        y = y > Q18_ONE ? Q18_ONE : (y < -Q18_ONE ? -Q18_ONE : y);   /* over a loud tail the two add up past full scale:
+                                                                * the product below would overflow and wrap (a click) */
         out[n] = op1_sat16((((y + 4) >> 3) * og) >> 15);       /* back to 16 bits */
     }
     if (!(F & F_TONE)) z1 = z2 = pre;                          /* where the open filter's stages are */
     t->restart = 0;
     t->ph = p;
+    t->ph_h = (uint8_t)ph;
     t->hp = lp;
     t->z1 = z1;
     t->z2 = z2;
@@ -345,7 +379,8 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     t2_get(op1_current_slot(), env);
     const int32_t sus = env[T2_SUSTAIN] * 32768;               /* Q30 */
     const int32_t glide = mode == MODE_GLIDE ? rc[REC_GLIDE] : 0;   /* only glide mode glides */
-    const int32_t sag = q15(params[3]);
+    /* sag, signed: the fall (word 3) or, with none, minus the rise (the record) */
+    const int32_t sag = q15(params[3]) ? q15(params[3]) : -rc[REC_RISE];
     const int32_t atk_ms = attack_ms(env[T2_ATTACK]);
     const int gate = held[v];
 
@@ -369,9 +404,11 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
                       : 47550u * exp2neg((uint32_t)((env[T2_RELEASE] * 32767 / REL_HOLD) * 35407) >> 15) >> 16;
     const int32_t dk = q15(params[5]);
     /* clip: soft .. hard. It sets the knee of stage 2 and of the last clipper, and how hard the last one is driven:
-     * 1.76x at soft (a plain sine just reaches the ceiling, rounded) up to 4x at hard (the same sine nearly square) */
+     * 1.76x at soft (a plain sine just reaches the ceiling, rounded) up to 4x at three quarters (the same sine nearly
+     * square), then the last quarter slams it, up to 16x (+12 dB more) at 100 %: a tail flattened to a square to the end */
     const int32_t clip = (q15(params[6]) + 7) >> 3;            /* Q12 */
-    const int32_t cg = 1802 + ((2294 * clip) >> 12);           /* Q10 */
+    const int32_t slam = clip > 3072 ? clip - 3072 : 0;        /* the last quarter, 0 .. 1024 */
+    const int32_t cg = 1802 + ((2294 * clip) >> 12) + ((slam * slam * 12) >> 10);   /* Q10, 1.76 .. 16x */
 
     /* a new note for this voice */
     if (stamp[v] != t->seen_stamp) {
@@ -382,10 +419,10 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
         } else {                                               /* restart: phase 0, both envelopes from the top */
             t->restart = t->live ? 2 : 1;
             if (!t->live) { t->d_s = dk << 8; t->hp = 0; t->last_y = 0; t->z1 = t->z2 = 0; t->f1 = t->f2 = 0; }   /* from silence: every hit the same */
-            t->sag = ONE30;
+            t->sag = ONE29;
             t->atk = atk_ms ? 0 : ONE30;                       /* attack: the sound fades in from nothing */
             t->fade = 32768; t->pk = Q18_ONE; t->pkacc = 0; t->pkn = 0;
-            t->ph = 0;
+            t->ph = 0; t->ph_h = 0;
             t->lvl = ONE30;
             t->pe = ONE30;
             t->off = 0;
@@ -434,14 +471,21 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     const int32_t da = (a1f - a0f) >> 7;
     const int32_t dg = (t->lvl - g0) >> 7;
 
-    /* sag: the pitch falls steadily while the note lasts, by up to two octaves over the amp decay's length (it stops
-     * three octaves down). The decay runs at ka a block with a time constant a fifth of its length, so over that length
-     * a factor (1 - ks) a block comes to 2^-(2 amount) with ks = 2 ln 2 / 5 * amount * ka. */
-    const uint32_t dq = (uint32_t)(ONE30 - t->sag) >> 14;      /* how far it has fallen, Q16 */
+    /* sag: the pitch falls (or, below 0, rises) steadily while the note lasts, over the amp decay's length by
+     * 0.75 (u + u^2) octaves, u = 0.7 sag falling, 0.5 |sag| rising: 25, 50, 75, 100 % fall about 1.9, 4.2, 7.2 and
+     * 10.7 semitones, -100 % rises 6.75 (0.9.12 had two octaves, linear: most of it was over by a third of the turn;
+     * 0.9.13 .. 0.9.17 the same law without the 0.7 and 0.5, of which the owner used -50 .. 70 %). It stops three octaves down, or one
+     * octave up. The decay runs at ka a block with a time constant a fifth of its length, so over that length a factor
+     * (1 -+ ks) a block comes to 2^-+(2 e) with ks = 2 ln 2 / 5 * e * ka, e = 0.375 (u + u^2). */
+    const int32_t dq = (ONE29 - t->sag) >> 14;                 /* how far it has fallen, Q15 (risen: < 0) */
     if (sag) {
-        const uint32_t ks = (uint32_t)(((uint64_t)ka * 18170u * (uint32_t)sag) >> 27);   /* Q20 */
-        t->sag -= (int32_t)(((int64_t)t->sag * ks) >> 20);
-        if (t->sag < ONE30 >> 3) t->sag = ONE30 >> 3;
+        /* the knob's ends are 0.9.15's 70 % fall and 50 % rise, the ranges the owner found useful */
+        const uint32_t u = sag > 0 ? (uint32_t)(sag * 7 / 10) : (uint32_t)(-sag) / 2;
+        const uint32_t e = (u * 12288u + ((u * u) >> 15) * 12288u) >> 15;
+        const uint32_t ks = (uint32_t)(((uint64_t)ka * 18170u * e) >> 27);   /* Q20 */
+        const int32_t step = (int32_t)(((int64_t)t->sag * ks) >> 20);
+        if (sag > 0) { t->sag -= step; if (t->sag < ONE29 >> 3) t->sag = ONE29 >> 3; }
+        else         { t->sag += step; if (t->sag > ONE30) t->sag = ONE30; }
     }
 
     if (glide) {                                               /* 0 .. 500 ms: the slide's time constant is a quarter */
@@ -483,9 +527,22 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
         tc = (int32_t)((wq << 11) / (65536u + wq));
         if (tc < 1) tc = 1;
     }
+    int32_t ow0;
 #ifndef SUB_MAX
-#define SUB_MAX 1229
+#define SUB_MAX 2048                          /* all of it at full: only the clean sine (0.9.7 .. 0.9.13: 60 %) */
 #endif
+    /* the sub an octave down while that is above the synth bus's 35 Hz high-pass: from the note's pitch now (glide and
+     * sag, not the knock), the octave in fully at 45 Hz and up, the note's own pitch at 40 Hz and under, a crossfade
+     * between. 45 Hz an octave down is a phase increment of 2 x 45 x 2^32 / 88200 */
+    {
+        int64_t ni = (int64_t)(inc[0] >> OCT_DOWN) + t->off;
+        ni = (ni * t->sag) >> 29;
+        const int32_t lo = 3895640, hi = 4382595;              /* 40 and 45 Hz, octave down */
+        const int32_t want = ni <= lo ? 0 : (ni >= hi ? 4096 : (int32_t)(((ni - lo) * 4096) / (hi - lo)));
+        ow0 = t->ow;
+        if (t->restart) ow0 = t->ow = want;
+        else t->ow += (want - t->ow) >> 2;                     /* a glide or a sag through it: ramped, no step */
+    }
     const int32_t sub = (rc[REC_SUB] * SUB_MAX) >> 15;         /* Q11: the clean sine's share after the clipper */
 
     /* ---- per sample: the loop built for what this block uses (see run_block) ---- */
@@ -493,7 +550,8 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     k.inc = inc; k.tab = op1_sin_tab();
     k.dm = dm; k.dg = dg; k.da = da; k.o = t->off; k.dq = dq;
     k.sh_tri = sh_tri; k.sh_saw = sh_saw; k.fb = fb; k.bk = bk; k.mix = mix; k.cpl = cpl; k.lift = lift; k.g2 = g2;
-    k.clip = clip; k.cg = cg; k.tc = tc; k.sub = sub; k.og = og;
+    k.clip = clip; k.cg = cg > 4096 ? cg >> 2 : cg; k.csh = cg > 4096 ? 8 : 10;   /* x cg stays in 32 bits */
+    k.tc = tc; k.sub = sub; k.og = og; k.ow = ow0 << 7; k.dow = t->ow - ow0;   /* from last block's share to this one's over the block */
     k.gg = (int32_t)(((int64_t)g0 * g1) >> 11);               /* envelope x stage 1's gain, Q27 (up to 8.0) */
     k.dgg = ((int32_t)(((int64_t)t->lvl * g1) >> 11) - k.gg) >> 7;
     k.m = m0; k.g = g0; k.av = a0f;
@@ -530,7 +588,8 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
 /* the engine's T1 page (KeyHandler thread). A plain turn is the OP-1's (words 0..3). Every Shift + turn is taken
  * here, at the core's fine Shift rate (a quarter of R246's delta: 256 a detent, faster when turned fast): blue drive
  * or clip, green knock length (words, kept with op1_engine_word_set), white sub and orange glide (the record). Pushes:
- * orange steps the play mode, Shift + blue switches drive / clip, the others do nothing */
+ * orange steps the play mode, Shift + blue switches drive / clip, the others do nothing. And the plain orange turn,
+ * sag, which goes below 0 */
 extern const op1_engine_ext2_t ENGINE_tyr8;
 static int ty_input(int page, int ev, int a, int b)
 {
@@ -545,7 +604,21 @@ static int ty_input(int page, int ev, int a, int b)
         } else if (b && a == 0 && op1_shift_held()) blue_clip ^= 1;
         return 1;
     }
-    if (ev != OP1_ENG_TURN || !op1_shift_held()) return 0;
+    if (ev != OP1_ENG_TURN) return 0;
+    if (!op1_shift_held()) {
+        if (a != 3) return 0;
+        /* orange, sag: -100 .. 100 %, a detent 1024 as the OP-1 turns a word. Up from 0 is the fall (word 3), down
+         * the rise (the record); one of them is 0 */
+        rec_get(slot, r);
+        const int32_t fall = q15(op1_synth_knobs(slot)[3]), was = fall ? fall : -r[REC_RISE];
+        int32_t v = was + b;
+        v = v < -32767 ? -32767 : (v > 32767 ? 32767 : v);
+        if (v == was) return 1;
+        const int32_t nf = v > 0 ? v : 0, nr = v < 0 ? -v : 0;
+        if (nf != fall) op1_engine_word_set(&ENGINE_tyr8.ext.voice, 3, nf);
+        if (nr != r[REC_RISE]) { r[REC_RISE] = (int16_t)nr; op1_engine_record_store(slot, TY_NAME, r, REC_N); }
+        return 1;
+    }
     const int st = b / 4;
     if (a < 2) {
         const int k = a ? 7 : (blue_clip ? 6 : 5);
@@ -730,6 +803,9 @@ typedef struct {
     int32_t rc, rt, rout;                     /* carcass, lug top, outer radius (the larger), Q10 px */
     int32_t wd;                               /* tread width, depth Q10 px */
     int32_t q;                                /* flattening: how far the bottom is pushed in, Q10 px */
+    int32_t inf;                              /* over-inflation: how far the tread is blown out, Q10 px */
+    int32_t bl, ba;                           /* and a blister on it, about to give: how far out (Q10 px), at angle ba */
+    uint8_t strain;                           /* a red strain line round the sidewall */
     int32_t rrim;                             /* the rim: the flattening stops here */
 } wheel_t;
 static wheel_t last_wheel;                    /* for the tests */
@@ -750,6 +826,31 @@ static op1_pt wp(const wheel_t *w, int32_t a, int32_t r, int32_t p)
         const int32_t bulge = (int32_t)(((int64_t)w->q * 2458 / w->rout * lo >> 10) * out >> 10);   /* Q10, 2.4 q / R */
         u += (int32_t)(((int64_t)u * bulge) >> 10);
         if (v < floor) v = floor;
+    }
+    if (w->inf > 0 && r > w->rrim) {                           /* blown up: the tread further out, the sidewalls */
+        int32_t out = (int32_t)(((int64_t)(r - w->rrim) * 1024) / (w->rout - w->rrim));   /* ballooning sideways */
+        if (out > 1024) out = 1024;
+        const int32_t f = (int32_t)(((int64_t)w->inf * out) / r);                         /* Q10: r grows by inf out */
+        u += (int32_t)(((int64_t)u * f) >> 10);
+        v += (int32_t)(((int64_t)v * f) >> 10);
+        int32_t f2 = f;
+        if (w->bl && v > -(r >> 2)) {                          /* (not where it would push into the road) */                                           /* the blister: a bump of the tread and wall at ba */
+            int32_t d = (a - w->ba) & 8191;
+            if (d > 4096) d -= 8192;
+            if (d < 0) d = -d;
+            if (d < 1100) {
+                const int32_t kb = ((1100 - d) * 1024) / 1100, kk = (kb * kb) >> 10;
+                const int32_t e = (int32_t)(((int64_t)w->bl * kk >> 10) * out / r);
+                u += (int32_t)(((int64_t)u * e) >> 10);
+                v += (int32_t)(((int64_t)v * e) >> 10);
+                f2 += e;
+            }
+        }
+        int32_t pb = (int32_t)(((int64_t)(w->inf + (int32_t)(((int64_t)(f2 - f) * r) >> 10)) * 7 / 2 * out >> 10)
+                               * (1024 - out) >> 8);                                             /* most mid-wall */
+        if (v < 0) pb = (int32_t)((int64_t)pb * (1024 + (int32_t)(((int64_t)v * 870) / r)) >> 10);   /* less low down, */
+                                                                     /* where it would push the wall into the road */
+        p += (int32_t)(((int64_t)(2 * p - w->wd) * pb) / w->wd);                        /* near face out, far face back */
     }
     op1_pt o;
     o.x = w->hx + ((u * TRV_X) >> 10) + ((p * BCK_X) >> 10);
@@ -1164,11 +1265,11 @@ static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
         fill_poly(band, 2 * (RING_N + 1), COL_WHITE);
         ring(r, w, r1, 0, COL_WHITE);
         ring(r, w, r1 + OP1_Q10(2), 0, COL_PIN);
-    } else ring(r, w, w->rc - span / 4, 0, COL_GREY);
+    } else ring(r, w, w->rc - span / 4, 0, w->strain ? COL_KNOB[3] : COL_GREY);   /* blown up: the line strains red */
 
     /* the rim: rigid, round, turning */
     wheel_t rg = *w;
-    rg.q = 0;
+    rg.q = 0; rg.inf = 0; rg.bl = 0;
     ring(r, &rg, w->rrim, 0, COL_WHITE);
     ring(r, &rg, w->rrim * R_DISH / R_RIM, w->wd / 5, COL_GREY);  /* the back of the dish */
     const int32_t rh = w->s * R_HUB;
@@ -1249,7 +1350,23 @@ static void ty_screen_update(void *scr, int dt)
     wh.rout = wh.rt;
     wh.wd = wh.s * TYRE_W;
     wh.rrim = wh.s * R_RIM;
-    wh.q = (int32_t)(((int64_t)(wh.rout - wh.rrim) * 13 / 20 * k[3]) >> 15);        /* sag: up to 65 % of the sidewall */
+    wh.q = (int32_t)(((int64_t)(wh.rout - wh.rrim) * 13 / 20 * q15(k[3])) >> 15);   /* sag: up to 65 % of the sidewall */
+    const int32_t rise = q15(k[3]) ? 0 : rc[REC_RISE];                                /* sag below 0: blown up, */
+    {   /* the tread out by up to 16 % of the radius, faster towards -100 %; from 60 % a blister swells on it, from 80 %
+         * the sidewall line strains red, and from 70 % the tyre quivers */
+        const int64_t side = wh.rout, r2 = ((int64_t)rise * rise) >> 15;
+        int32_t inf = (int32_t)((side * (6 * rise + 10 * r2) / 100) >> 15);
+        int32_t bl = rise > 19660 ? (int32_t)((side * 8 / 100 * (rise - 19660)) / 13107) : 0;
+        /* but no taller than the largest tyre, blown up 7 px: the screen's top. A smaller tyre blows up further */
+        const int32_t room = 829 * (R_C + LUG_H) + OP1_Q10(7) - wh.rout;
+        if (inf + bl > room) {
+            const int32_t sc = room > 0 ? (int32_t)(((int64_t)room << 10) / (inf + bl)) : 0;
+            inf = (int32_t)(((int64_t)inf * sc) >> 10); bl = (int32_t)(((int64_t)bl * sc) >> 10);
+        }
+        wh.inf = inf; wh.bl = bl;
+        wh.ba = -(int32_t)(ang >> 8) + 1400;                                              /* it turns with the tyre */
+        wh.strain = rise > 26214;
+    }
 
     /* spin: the sounding pitch (12 .. 200 Hz counted), 32 Hz = one turn a second */
     const int32_t lv = vis_lvl;
@@ -1285,8 +1402,15 @@ static void ty_screen_update(void *scr, int dt)
         }
     }
     wh.hx = OP1_Q10(CON_X);
-    wh.hy = OP1_Q10(CON_Y) - (wh.rout - wh.q) + by;
+    wh.hy = OP1_Q10(CON_Y) - (wh.rout - wh.q + wh.inf) + by;
     vis_hub_y = wh.hy;
+    static uint8_t quiver;
+    if (rise > 22937) {                                                      /* about to go: a 1 .. 1.6 px quiver */
+        quiver++;
+        const int32_t qa = OP1_Q10(1) + (int32_t)((OP1_Q10(1) * 3 / 5 * (int64_t)(rise - 22937)) / 9830);
+        const int32_t qs = quiver & 1 ? qa : -qa;                           /* along the road, so it stays on it */
+        wh.hx += (qs * TRV_X) >> 10; wh.hy += (qs * TRV_Y) >> 10;
+    }
     last_wheel = wh;
 
     /* the labels: what they say this frame */
@@ -1314,7 +1438,9 @@ static void ty_screen_update(void *scr, int dt)
         num[0] = ((val[0] * 200 + 16384) >> 15) - 50;                        /* -50 feedback sine, 0 sine, 50 triangle, 100 saw, 150 feedback saw */
         num[1] = (val[1] * 100 + 16384) >> 15;
         num[2] = (val[2] * 100 + 16384) >> 15;                               /* tone: how open */
-        num[3] = (val[3] * 100 + 16384) >> 15;                               /* sag, % */
+        if (!q15(k[3]) && rc[REC_RISE]) val[3] = rc[REC_RISE];              /* sag: the gauge shows how much, */
+        num[3] = (val[3] * 100 + 16384) >> 15;                               /* the value, %, its way: */
+        if (!q15(k[3]) && rc[REC_RISE]) num[3] = -num[3];                    /* below 0 it rises */
     }
     static const char *const modes[MODE_N] = { "MONO GLIDE", "MONO RETRIG" };
     const char *const mt = modes[mode_of(slot)];

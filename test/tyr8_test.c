@@ -21,6 +21,7 @@ static int sag_w;                             /* sag: word 3 (orange) since 0.9.
 static int16_t P[8];
 static void sag(int v) { sag_w = v; P[3] = (int16_t)v; host_knobs[0][3] = (int16_t)v; }
 static void glide_rec(int v) { host_eng_rec[0][REC_GLIDE] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
+static void rise(int v) { host_eng_rec[0][REC_RISE] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
 static void sub(int v) { host_eng_rec[0][REC_SUB] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
 static void mode(int m) { host_eng_rec[0][0] = (int16_t)m; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
 #define SINE 8192                             /* the shape knob's plain sine: a quarter up */
@@ -28,7 +29,7 @@ static void mode(int m) { host_eng_rec[0][0] = (int16_t)m; host_eng_rec_owner[0]
 #define T2_HI 16320
 static int tone_w = 32767, atk_w = T2_LO, rel_w = T2_HI;   /* tone open, no attack, release HOLD */
 static int active[6]; static double key_hz[6];      /* the key's own frequency, as the firmware gives it */
-static int16_t *rec; static size_t rec_n, rec_cap;
+static int16_t *rec; static size_t rec_n, rec_cap; static int raw_peak;
 static uint32_t audio_hash = 2166136261u;
 static int rec_get_mode(void);     /* FNV-1a over every sample rendered: a speed-up must leave it as it was */
 
@@ -52,6 +53,14 @@ static int shift_turn(int a, int delta)
     for (int k = 5; k < 8; k++) host_knobs[0][k] = host_eng_words[0][k];
     return took;
 }
+/* a plain orange turn (sag) through the input hook: word 3 and the record */
+static int orange_turn(int delta)
+{
+    host_eng_words[0][3] = host_knobs[0][3];
+    const int took = ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 3, delta);
+    sag(host_eng_words[0][3]);
+    return took;
+}
 static void reset(void)
 {
     memset((void *)held, 0, sizeof held); owner = -1; memset(tv, 0, sizeof tv);
@@ -73,8 +82,21 @@ static void run_ms(double ms)
             for (int n = 0; n < 128; n++) sum[n] += o[n];
         }
         if (rec_n + 128 > rec_cap) { rec_cap = rec_cap ? rec_cap * 2 : 1 << 20; rec = realloc(rec, rec_cap * 2); }
-        for (int n = 0; n < 128; n++) { rec[rec_n++] = op1_sat16(sum[n]); audio_hash = (audio_hash ^ (uint16_t)rec[rec_n - 1]) * 16777619u; }
+        /* recorded as if at full scale (x 32767 / OUT_GAIN), so the checks read levels against the voice's own ceiling;
+         * raw_peak keeps what the OP-1 gets */
+        for (int n = 0; n < 128; n++) { if (abs(sum[n]) > raw_peak) raw_peak = abs(sum[n]);
+            rec[rec_n++] = op1_sat16((int32_t)lrint(sum[n] * (32767.0 / OUT_GAIN))); audio_hash = (audio_hash ^ (uint16_t)sum[n]) * 16777619u; }
     }
+}
+/* the peak of what was recorded, at the OP-1's level, after the synth bus's 35 Hz high-pass (two poles) */
+static double bus_peak(void)
+{
+    const double a = exp(-2 * M_PI * 35 / 88200.0); double px = 0, y1 = 0, qx = 0, y2 = 0, hp = 0;
+    for (size_t i = 0; i < rec_n; i++) {
+        const double x = rec[i] * (OUT_GAIN / 32767.0);
+        y1 = a * (y1 + x - px); px = x; y2 = a * (y2 + y1 - qx); qx = y1;
+        if (fabs(y2) > hp) hp = fabs(y2); }
+    return hp;
 }
 static int peak(size_t a, size_t b) { int p = 0; for (size_t i = a; i < b && i < rec_n; i++) if (abs(rec[i]) > p) p = abs(rec[i]); return p; }
 static size_t at(double ms) { return (size_t)(ms * 88.2); }
@@ -320,6 +342,50 @@ int main(int argc, char **argv)
     CHECK(jump < 900, "legato: no step in the wave (largest sample step %d)", jump);
     wav("legato_glide");
 
+    /* 7c. the OP-1 starting two voices for one key (unison): the second voice of a press is not legato over the first,
+     * so with the last key up the next press restarts, with its knock, while the old tail still rings */
+    reset(); set(SINE, 20000, 3000, 26000, 14000, 12000, 0, 100);
+    on(0, 55, 127); on(1, 55, 127); run_ms(150); offk(0); offk(1); run_ms(150);
+    { const uint32_t t0 = vis_trig; size_t k0 = rec_n; on(2, 82, 127); on(3, 82, 127); run_ms(200);
+      CHECK(vis_trig > t0 && freq(k0, k0 + at(30)) > 120, "unison: the next press restarts over the tail, knock and all (restarts %u, %.0f Hz in its first 30 ms)", vis_trig - t0, freq(k0, k0 + at(30))); }
+    offk(2); offk(3); run_ms(2000);
+
+    /* 7b. glide only while a key is down: released, the next note restarts even while the tail rings */
+    reset(); set(SINE, 0, 0, 26000, 0, 0, 0, 100); rel_w = T2_HI;
+    on(0, 55, 127); run_ms(100); offk(0); run_ms(100); { const uint32_t t0 = vis_trig; on(1, 110, 127); run_ms(200);
+      CHECK(vis_trig == t0 + 1 && fabs(freq(rec_n - at(150), rec_n) - 110) < 1, "glide mode, the first key up: the next note restarts at its pitch (%.1f Hz), no glide", freq(rec_n - at(150), rec_n)); }
+    offk(1); run_ms(50);
+
+    /* 7d. clicks at a note's start: the energy above ~2 kHz in the 6 ms after it starts, against a pure 55 Hz sine's.
+     * Full sub (a clean sine): from silence, and cutting off a ringing note mid-swing */
+    if (getenv("TY_CLICK")) {
+        sub(32767);
+        for (int c = 0; c < 2; c++) {
+            reset(); set(SINE, 0, 0, 26000, 14000, 12000, 0, 0);
+            size_t k0;
+            if (c) { on(0, 55, 127); run_ms(123); offk(0); run_ms(4); }
+            k0 = rec_n; on(1, 55, 127); run_ms(40);
+            double hf = 0; for (size_t i = k0 + 2; i < k0 + at(6); i++) { const double d2 = rec[i] - 2.0 * rec[i - 1] + rec[i - 2]; hf += d2 * d2; }
+            printf("click %s: hf %.0f\n", c ? "over a ringing note" : "from silence", hf / at(6));
+        }
+        sub(0);
+    }
+
+    /* 7f. retrig mode: letting the newest key go restarts the key still held underneath, knock and all; one voice a
+     * key, and two (unison) */
+    mode(MODE_RETRIG);
+    for (int u = 0; u < 2; u++) {
+        reset(); set(SINE, 20000, 3000, 26000, 14000, 12000, 127, 0);
+        on(0, 55, 127); if (u) on(1, 55, 127); run_ms(150);
+        on(2, 82, 127); if (u) on(3, 82, 127); run_ms(150);
+        const uint32_t t0 = vis_trig; size_t k0 = rec_n;
+        offk(2); if (u) offk(3); run_ms(100);
+        CHECK(vis_trig > t0 && freq(k0, k0 + at(30)) > 90, "retrig, %s: letting the newest key go restarts the held one with its knock (restarts %u, %.0f Hz in its first 30 ms)",
+              u ? "unison" : "one voice a key", vis_trig - t0, freq(k0, k0 + at(30)));
+        offk(0); offk(1); run_ms(2000);
+    }
+    mode(MODE_GLIDE);
+
     /* 8. retrigger over a sounding note: restart without a click */
     reset(); set(SINE, 0, 0, 20000, 0, 0, 0, 0);
     on(0, 55, 127); run_ms(104); offk(0); run_ms(10); size_t tr = rec_n; on(1, 55, 127); run_ms(100);
@@ -358,7 +424,7 @@ int main(int argc, char **argv)
 
     /* 10. triangle, velocity */
     reset(); set(16384, 0, 0, 6000, 0, 0, 127, 0); on(0, 55, 64); run_ms(300);
-    int lin = 1; for (size_t i = at(200) + 2; i < at(200) + 300; i++) { int d1 = rec[i] - rec[i - 1], d0 = rec[i - 1] - rec[i - 2]; if ((d1 > 0) == (d0 > 0) && abs(d1 - d0) > 6) lin = 0; }
+    int lin = 1; for (size_t i = at(200) + 2; i < at(200) + 300; i++) { int d1 = rec[i] - rec[i - 1], d0 = rec[i - 1] - rec[i - 2]; if ((d1 > 0) == (d0 > 0) && abs(d1 - d0) > 6 * 32767 / OUT_GAIN) lin = 0; }   /* (the rounding, scaled up with rec) */
     CHECK(lin, "shape at half is a triangle (straight flanks)");
     CHECK(abs(peak(at(200), rec_n) - hold * 64 / 127) < hold / 8, "velocity 64 is about half as loud (peak %d)", peak(at(200), rec_n));
     wav("triangle_vel64");
@@ -385,7 +451,7 @@ int main(int argc, char **argv)
     CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1) == 1 && host_eng_rec[0][0] == MODE_RETRIG, "orange push: glide -> retrig");
     ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 0); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1);
     CHECK(host_eng_rec[0][0] == MODE_GLIDE, "orange push: retrig -> glide (two modes, no poly)");
-    CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 3, 1024) == 0 && ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1) == 0 && host_eng_rec[0][0] == MODE_GLIDE, "orange's turn, and other pages, are left to the OP-1");
+    CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1) == 0 && host_eng_rec[0][0] == MODE_GLIDE, "other pages' pushes are left to the OP-1");
     host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1); host_shift_held = 0;
     CHECK(host_eng_rec[0][0] == MODE_RETRIG, "orange push with Shift held still steps the play mode");
     mode(MODE_GLIDE);
@@ -404,8 +470,9 @@ int main(int argc, char **argv)
     CHECK(stp < 1500, "attack: a restart over a sounding note does not click (largest sample step %d)", stp);
     atk_w = T2_LO;
     double hfm[3], rmsm[3];
-    for (int c = 0; c < 3; c++) {                               /* full drive, hard: plain, tone closed, sub full */
-        sub(c == 2 ? 32767 : 0); tone(c == 1 ? 0 : 32767); reset(); set(SINE, 0, 0, 6000, 32767, 32767, 127, 0); on(0, 55, 127); run_ms(600);
+    for (int c = 0; c < 3; c++) {                               /* full drive, hard (75 %: 100 % slams the clipper, which squares a dark wall
+                                                                 * bright again): plain, tone closed, sub full */
+        sub(c == 2 ? 32767 : 0); tone(c == 1 ? 0 : 32767); reset(); set(SINE, 0, 0, 6000, 32767, 24576, 127, 0); on(0, 55, 127); run_ms(600);
         double e = 0, de = 0;
         for (size_t i = at(300); i < rec_n; i++) { e += (double)rec[i] * rec[i]; de += (double)(rec[i] - rec[i - 1]) * (rec[i] - rec[i - 1]); }
         hfm[c] = de / e; rmsm[c] = sqrt(e / (rec_n - at(300)));
@@ -442,6 +509,13 @@ int main(int argc, char **argv)
     shift_turn(2, -100 * 1024);
     CHECK(host_eng_rec[0][REC_SUB] == 0, "sub stops at 0");
     CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_TURN, 0, 1024) == 0, "T2's turns are the OP-1's (it turns the envelope words)");
+    sag(0); host_eng_rec[0][REC_SUB] = 0; host_eng_rec[0][REC_GLIDE] = 0;
+    CHECK(orange_turn(-2 * 1024) == 1 && host_knobs[0][3] == 0 && host_eng_rec[0][REC_RISE] == 2048, "orange below 0: sag rises (record %d), the fall word stays 0", host_eng_rec[0][REC_RISE]);
+    orange_turn(5 * 1024);
+    CHECK(host_knobs[0][3] == 3072 && host_eng_rec[0][REC_RISE] == 0, "and back up through 0: the fall %d, the rise cleared", host_knobs[0][3]);
+    orange_turn(100 * 1024); const int top3 = host_knobs[0][3]; orange_turn(-200 * 1024);
+    CHECK(top3 == 32767 && host_knobs[0][3] == 0 && host_eng_rec[0][REC_RISE] == 32767 && host_eng_rec[0][REC_MODE] == MODE_GLIDE, "sag stops at 100 %% and -100 %%, the mode kept");
+    sag(0); rise(0);
     memset(host_eng_rec[0], 0, sizeof host_eng_rec[0]); mode(MODE_GLIDE);
 
     /* 12c. release (T2 orange) and the defaults of a slot with no T2 words */
@@ -505,13 +579,38 @@ int main(int argc, char **argv)
     CHECK(freq(at(500), at(700)) > fs1 * 1.1 && freq(at(500), at(700)) < 54, "sag at half falls less (%.1f Hz)", freq(at(500), at(700)));
     sag(0); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
     CHECK(fabs(freq(at(500), at(700)) - 55) < 0.3, "sag at 0: none (%.2f Hz)", freq(at(500), at(700)));
-    sag(0);
+    /* the law: 25 %% about 1.9 semitones over the decay's length, 50 %% 4.2, 75 %% 7.2, 100 %% 10.7. Decay 0.6 s here, word 16000:
+     * the note's length is the decay's (a fifth of it is the time constant), so measure 0.6 s on */
+    { const double want[4] = { 1.85, 4.25, 7.2, 10.7 }; double got[4];
+      for (int c = 0; c < 4; c++) {
+          sag((c + 1) * 8192 - (c == 3)); reset(); set(SINE, 0, 0, 16000, 0, 0, 127, 0); on(0, 55, 127); run_ms(700);
+          got[c] = 12 * log2(55 / freq(at(520), at(680)));
+      }
+      CHECK(fabs(got[0] - want[0]) < 0.8 && fabs(got[1] - want[1]) < 1 && fabs(got[2] - want[2]) < 1.3 && fabs(got[3] - want[3]) < 1.6,
+            "sag 25, 50, 75, 100 %%: %.1f, %.1f, %.1f, %.1f semitones down after the decay's length", got[0], got[1], got[2], got[3]); }
+    sag(0); rise(32767); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
+    const double fr0 = freq(0, at(60)), fr1 = freq(at(500), at(700)), fr2 = freq(at(1100), at(1260));
+    CHECK(fr0 > 55 && fr0 < 60 && fr1 > fr0 * 1.2 && fr2 > fr1 * 1.1 && fr2 < 100, "sag at -100 %%: it rises, %.1f Hz at the start, %.1f half a second on, %.1f at the end (under its octave cap)", fr0, fr1, fr2);
+    wav("sag_rise");
+    rise(8192); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
+    CHECK(freq(at(500), at(700)) > 56 && freq(at(500), at(700)) < fr1 * 0.9, "sag at -25 %%: rises less (%.1f Hz)", freq(at(500), at(700)));
+    rise(0); sag(0);
 
     /* the sound this was for: full feedback saw, a long deep knock, sag, drive up, the tone half closed */
     sag(20479); tone(18430); reset(); set(31500, 22000, 20000, 26000, 28000, 26000, 0, 0);
     on(0, 43.65, 127); run_ms(150); offk(0); run_ms(1400); on(1, 38.89, 127); run_ms(150); offk(1); run_ms(5000);
     CHECK(peak(0, rec_n) <= 32768 && !active[0] && !active[1] && peak(rec_n - at(100), rec_n) == 0, "the doom patch stays in range and ends");
     wav("doom");
+    { /* headroom for the bus: through two 35 Hz one-pole high-passes, as the OP-1's synth bus (modelled: its order is
+       * not known), an ordinary one-shot (the default drive and clip) goes about 1.5 dB over full scale at its onset, the
+       * doom patch (full feedback saw, drive and clip up) about 2. The price of -4 dB instead of 0.9.17's -6.5, which the
+       * owner found too quiet; at full scale (up to 0.9.16) it was 5.5 and 6 over, and the OP-1 clipped every note */
+      const double doom = bus_peak();
+      raw_peak = 0; reset(); set(SINE, 0, 0, 16000, 14000, 12000, 0, 0); on(0, 55, 127); run_ms(300); offk(0); run_ms(800);
+      const double plain = bus_peak();
+      CHECK(raw_peak <= OUT_GAIN + 1 && raw_peak > OUT_GAIN - 200 && plain < 32767 * 1.22 && doom < 32767 * 1.32,
+            "headroom: a note peaks at %d (-4 dB); after the bus's 35 Hz high-pass an ordinary one-shot at %+.1f dB, the doom patch at %+.1f dB",
+            raw_peak, 20 * log10(plain / 32767), 20 * log10(doom / 32767)); }
     sag(0); tone(32767);
 
     /* 18. the tail: a clean tone while it is loud enough to have bits for it, then a fast fade to exact silence instead
@@ -549,6 +648,16 @@ int main(int argc, char **argv)
     }
     CHECK(ch[1] > ch[0] * 2.5, "clip at the default drive: hard has %.1f times the treble of soft", ch[1] / ch[0]);
     CHECK(cr[0] < 0.85 && cr[1] > 0.93, "clip with no drive: a rounded sine at soft (rms %.2f), nearly square at hard (rms %.2f)", cr[0], cr[1]);
+    /* the last quarter slams it: at 100 %% the tail stays square far longer than at 75 %% */
+    { double tl[2];
+      for (int c = 0; c < 2; c++) {
+          reset(); set(SINE, 0, 0, 16000, 0, c ? 32767 : 24576, 127, 0); on(0, 55, 127); run_ms(80); offk(0); run_ms(1500);
+          double e = 0; for (size_t i = at(500); i < at(700); i++) e += (double)rec[i] * rec[i];
+          tl[c] = sqrt(e / (at(700) - at(500))) / 32768;
+          CHECK(peak(0, rec_n) <= 32768, "clip %s: inside 16 bits", c ? "100 %" : "75 %");
+          if (c) wav("clip_slam");
+      }
+      CHECK(tl[1] > tl[0] * 2.5, "clip 100 %% slams the clipper: the tail 0.5 s on is %.1f times louder than at 75 %% (rms %.2f)", tl[1] / tl[0], tl[1]); }
 
     /* 20. the sub is heard: blended in after the clipper, its clean sine takes over the low end as it goes up. Measured
      * as the share of the output that is a 55 Hz sine, at the default drive and at full drive, sine and saw. (Before
@@ -570,6 +679,27 @@ int main(int argc, char **argv)
         CHECK(sine_part(at(300), at(700), 55) > (c < 2 ? 0.985 : 0.72), "sub full, no drive, shape %d %%: %.1f %% of the output's amplitude is a 55 Hz sine", shp[c] * 200 / 32767 - 50, sine_part(at(300), at(700), 55) * 100);
     }
     sub(0); tone(32767);
+    /* the octave-down sub: at 110 Hz it is 55 Hz, clean, the whole output at full; at 55 Hz (27.5 down, under the bus's
+     * 35 Hz high-pass) it stays at the note; at 85 Hz (42.5 down) half and half; at half the sub, half of it */
+    { sub(32767); reset(); set(SINE, 0, 4500, 16000, 14000, 12000, 127, 0); on(0, 110, 127); run_ms(700);
+      const double o_full = sine_part(at(300), at(700), 55), n_full = sine_part(at(300), at(700), 110);
+      wav("sub_octave_110");
+      CHECK(o_full > 0.98 && n_full < 0.05, "sub full at 110 Hz: the output is a 55 Hz sine (%.1f %%), none of the note left (%.1f %%)", o_full * 100, n_full * 100);
+      sub(16384); reset(); set(SINE, 0, 4500, 16000, 14000, 12000, 127, 0); on(0, 110, 127); run_ms(700);
+      const double o_half = sine_part(at(300), at(700), 55);
+      CHECK(o_half > 0.4 && o_half < 0.6, "sub half at 110 Hz: half of it the octave down (%.0f %%)", o_half * 100);
+      sub(32767); reset(); set(SINE, 0, 4500, 16000, 14000, 12000, 127, 0); on(0, 85, 127); run_ms(700);
+      const double o_mid = sine_part(at(300), at(700), 42.5), n_mid = sine_part(at(300), at(700), 85);
+      CHECK(fabs(o_mid - n_mid) < 0.15 && o_mid + n_mid > 1.3, "sub full at 85 Hz, between 40 and 45 Hz down: crossfaded evenly, %.0f %% at 42.5 Hz, %.0f %% at 85 (two equal sines: 71 %% each)", o_mid * 100, n_mid * 100);
+      sub(32767); reset(); set(SINE, 0, 4500, 16000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(700);
+      CHECK(sine_part(at(300), at(700), 27.5) < 0.02, "sub full at 55 Hz: nothing at 27.5 Hz, under the bus filter (%.1f %%)", sine_part(at(300), at(700), 27.5) * 100);
+      /* a glide from 55 up to 110 crosses the floor without a click */
+      reset(); set(SINE, 0, 4500, 16000, 14000, 12000, 127, 100); on(0, 55, 127); run_ms(200); size_t g0 = rec_n; on(1, 110, 127); run_ms(500);
+      int jump = 0; for (size_t i = g0; i < rec_n; i++) if (abs(rec[i] - rec[i - 1]) > jump) jump = abs(rec[i] - rec[i - 1]);
+      CHECK(jump < 600, "a glide up through the floor crossfades the sub smoothly (largest sample step %d)", jump);
+      wav("sub_glide_floor");
+      offk(0); offk(1); run_ms(500); }
+    sub(0);
 
     /* a phrase to listen to */
     reset(); set(10000, 14000, 6000, 20000, 14000, 12000, 0, 60);
@@ -633,7 +763,16 @@ int main(int argc, char **argv)
     sag(32767); frame("flat: sag full"); double fw1, ht1; near_shape(&low, &fw1, &ht1);
     CHECK(fw1 > fw0 + 15 && ht1 < ht - 6 && low > -0.6 && low < 0.6, "sag flattens the bottom onto the road: %.1f px of it on the road (%.1f round), %.1f px lower", fw1, fw0, ht - ht1);
     CHECK(fabs(vis_hub_y / 1024.0 + (last_wheel.rout - last_wheel.q) / 1024.0 - CON_Y) < 0.6, "and the flat stays on the road");
-    sag(0);
+    sag(0); rise(32767); frame("blown up: sag -100 %"); double fw2, ht2; near_shape(&low, &fw2, &ht2);
+    CHECK(ht2 > ht + 4 && low > -0.6 && low < 0.6, "sag below 0 blows the tyre up: %.1f px taller (contact %.1f px, %.1f round), still on the road (%.2f)", ht2 - ht, fw2, fw0, low);
+    { const int16_t d0 = host_t2[0][1], c6 = host_knobs[0][6], c5 = host_knobs[0][5];
+      host_t2[0][1] = t2_of(0.4); host_knobs[0][6] = 0; host_knobs[0][5] = 0;
+      rise(0); frame("mid size slick"); double fwm, htm, low0, ht0; near_shape(&low0, &fwm, &ht0); rise(32767);
+      frame("blown up: mid size slick"); near_shape(&low, &fwm, &htm);
+      CHECK(low > low0 - 0.8 && low < low0 + 0.8 && htm > ht0 + 8, "a mid-size slick blown up: %.1f px taller, as low as round (%.2f, round %.2f)", htm - ht0, low, low0);
+      host_t2[0][1] = T2_HI; frame("blown up: largest slick");                  /* a still to look at */
+      host_t2[0][1] = d0; host_knobs[0][6] = c6; host_knobs[0][5] = c5; }
+    rise(0);
     sub(0); frame("sub 0: a plain dish");
     CHECK(vis_spokes == 0 && !vis_whitewall && !vis_spinner, "sub 0: no spokes, no whitewall, no spinner");
     sub(9830); frame("sub 30 %: spokes growing");
@@ -659,7 +798,15 @@ int main(int argc, char **argv)
     }
     CHECK((rest - top) / 1024.0 > 5, "a note kicks the wheel off the road (%.1f px)", (rest - top) / 1024.0);
     CHECK(shadow >= 2, "and its shadow stays on the road");
-    CHECK(!offscreen, "nothing goes off the screen or below its lower margin, at the largest size, flat, lowrider, bouncing");
+    sag(0); rise(32767); vis_trig++;
+    for (int i = 0; i < 90; i++) {
+        frame(i == 6 ? "blown up: bounce" : "blown up, rolling");
+        for (int j = 0; j < nlines; j++) if (lines[j].y1 > OP1_Q10(150) || lines[j].y0 > OP1_Q10(150) || lines[j].x0 < OP1_Q10(2) || lines[j].x1 < OP1_Q10(2) || lines[j].x0 > OP1_Q10(318) || lines[j].x1 > OP1_Q10(318) || lines[j].y0 < OP1_Q10(2) || lines[j].y1 < OP1_Q10(2)) offscreen = 1;
+        for (int q = 0; q < npolys; q++) for (int j = 0; j < polys[q].n; j++) if (polys[q].p[j].y > OP1_Q10(150) || polys[q].p[j].y < OP1_Q10(2) || polys[q].p[j].x < OP1_Q10(2) || polys[q].p[j].x > OP1_Q10(318)) offscreen = 1;
+        escapes += dyn_escapes();
+    }
+    rise(0); sag(32767);
+    CHECK(!offscreen, "nothing goes off the screen or below its lower margin, at the largest size, flat or blown up, lowrider, bouncing");
     host_knobs[0][1] = 32767; for (int i = 0; i < 40; i++) { frame("rough road, rolling"); escapes += dyn_escapes(); } host_knobs[0][1] = 20000;
     CHECK(escapes == 0 && dyn_from > 0, "no moving stroke or fill reaches the still label layer (%d escapes)", escapes);
     CHECK(ang != a0, "the wheel turns while a note sounds");
@@ -691,6 +838,8 @@ int main(int argc, char **argv)
     host_knobs[0][0] = 8192;
     host_knobs[0][2] = 32767; sag(32767); host_shift_held = 1; glide_rec(32767); frame("shift held, glide 500 ms"); host_shift_held = 0; frame("tone open, sag 100 %"); TEXT_SCAN(txt3, bad3, cor3); CHECK(!bad3, "the longest tone and sag values fit"); host_shift_held = 1; frame("shift held, glide 500 ms"); TEXT_SCAN(txt3, bad3, cor3);
     CHECK(!bad3, "the longest tone and glide values fit their corners");
+    host_shift_held = 0; sag(0); rise(32767); frame("sag -100 %"); TEXT_SCAN(txt3, bad3, cor3); rise(0);
+    CHECK(!bad3, "sag -100 %% fits, with its sign");
     host_shift_held = 0;
 
     /* the T2 page: the envelope curve and four labels */
