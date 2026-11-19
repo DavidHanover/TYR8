@@ -33,10 +33,10 @@ encoder's colour shows its name and setting.
 
 | Encoder | Turn | Shift + turn |
 |---|---|---|
-| Blue | `SHAPE`: the wave. 0 % sine, 50 % triangle, 100 % saw; below 0 % and above 100 % the output feeds back into the oscillator, until there is no steady pitch | `DRIVE`: distortion before the clipper, up to 30 dB: fatter, then gritty. **Shift + push blue** switches this to `CLIP`, the final clipper from a rounded soft clip to a hard brick wall (squarer and brighter); push again for drive |
+| Blue | `SHAPE`: the wave. 0 % sine, 50 % triangle, 100 % saw; below 0 % and above 100 % the output feeds back into the oscillator, until there is no steady pitch | `DRIVE`: distortion before the clipper, up to 30 dB: fatter, then gritty. **Shift + push blue** switches this to `CLIP`, the final clipper from a rounded soft clip to a hard brick wall (squarer and brighter); its last quarter slams it, up to 16x at 100 %; push again for drive |
 | Green | `KNOCK`: how far the pitch starts above the note before dropping onto it, up to 16 times its frequency | `KNOCK LEN`: how long that drop takes, 20 ms (a click) to 1.5 s (a slow dive) |
 | White | `TONE`: a low-pass after the drive. 100 % is open; lower is darker, down to 140 Hz | `SUB`: blends a clean sine at the note in after the clipper, so it stays clean: more weight, less grit. At full it is 60 % of the output |
-| Orange | `SAG`: the pitch falls while the note lasts, by up to two octaves over the decay | `GLIDE`: how long the pitch slides between overlapping notes, 0 to 500 ms. `MONO GLIDE` only |
+| Orange | `SAG`, -100 to 100 %: above 0 the pitch falls while the note lasts (about 3 semitones over the decay at 25 %, 7 at 50 %, 12 at 75 %, 18 at 100 %); below 0 it rises the same way, up to an octave | `GLIDE`: how long the pitch slides between overlapping notes, 0 to 500 ms. `MONO GLIDE` only |
 
 **Push orange** (with or without Shift) to switch between the two play modes. The current one is shown under orange's label.
 
@@ -69,7 +69,7 @@ a curb, a sidewalk and grass behind it, all scrolling past. Each part follows a 
 |---|---|
 | Size, small car tyre to monster truck | `DECAY` (T2) |
 | Tread: a smooth racing slick at 0, then staggered off-road blocks rising | `DRIVE` or `CLIP`, whichever is higher |
-| A flat: the bottom squashes onto the road and the sidewall bulges | `SAG` |
+| A flat: the bottom squashes onto the road and the sidewall bulges; below 0 the tyre is blown up, taller and ballooning | `SAG` |
 | Rim, from a plain dish to laced lowrider wire spokes, then a whitewall with an orange pinstripe, then a gold knock-off spinner | `SUB` |
 | Spin, and the road's dashed centre line scrolling under it | the pitch, while a note sounds |
 | A bounce on every new note, and a rough road: rocks in the tyre's path (it hops over them), cracks in the pavement, and from 40 % weeds in the cracks | `KNOCK` |

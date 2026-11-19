@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.13
+- SAG goes from -100 % to 100 %. Below 0 the pitch rises while the note lasts (up to an octave), and the tyre blows
+  up: taller, its sidewalls ballooning out. Sounds saved before keep their sag.
+- SAG's law is gentler, so the whole turn is heard: about 3 semitones over the decay at 25 %, 7 at 50 %, 12 at 75 %
+  and 18 at 100 % (it was two octaves at 100 %, linear, and mostly done by a third of the turn).
+- CLIP's last quarter slams the clipper: from 4x at 75 % up to 16x (+12 dB) at 100 %, so the note stays a square
+  wall far down its tail. At 100 % it squares a closed tone bright again; back off to 75 % for a dark wall.
+
 ## 0.9.12
 A lighter screen, the same picture.
 

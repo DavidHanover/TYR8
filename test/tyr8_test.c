@@ -21,6 +21,7 @@ static int sag_w;                             /* sag: word 3 (orange) since 0.9.
 static int16_t P[8];
 static void sag(int v) { sag_w = v; P[3] = (int16_t)v; host_knobs[0][3] = (int16_t)v; }
 static void glide_rec(int v) { host_eng_rec[0][REC_GLIDE] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
+static void rise(int v) { host_eng_rec[0][REC_RISE] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
 static void sub(int v) { host_eng_rec[0][REC_SUB] = (int16_t)v; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
 static void mode(int m) { host_eng_rec[0][0] = (int16_t)m; host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); }
 #define SINE 8192                             /* the shape knob's plain sine: a quarter up */
@@ -50,6 +51,14 @@ static int shift_turn(int a, int delta)
     const int took = ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, a, delta);
     host_shift_held = 0;
     for (int k = 5; k < 8; k++) host_knobs[0][k] = host_eng_words[0][k];
+    return took;
+}
+/* a plain orange turn (sag) through the input hook: word 3 and the record */
+static int orange_turn(int delta)
+{
+    host_eng_words[0][3] = host_knobs[0][3];
+    const int took = ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 3, delta);
+    sag(host_eng_words[0][3]);
     return took;
 }
 static void reset(void)
@@ -385,7 +394,7 @@ int main(int argc, char **argv)
     CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1) == 1 && host_eng_rec[0][0] == MODE_RETRIG, "orange push: glide -> retrig");
     ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 0); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1);
     CHECK(host_eng_rec[0][0] == MODE_GLIDE, "orange push: retrig -> glide (two modes, no poly)");
-    CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 3, 1024) == 0 && ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1) == 0 && host_eng_rec[0][0] == MODE_GLIDE, "orange's turn, and other pages, are left to the OP-1");
+    CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1) == 0 && host_eng_rec[0][0] == MODE_GLIDE, "other pages' pushes are left to the OP-1");
     host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1); host_shift_held = 0;
     CHECK(host_eng_rec[0][0] == MODE_RETRIG, "orange push with Shift held still steps the play mode");
     mode(MODE_GLIDE);
@@ -404,8 +413,9 @@ int main(int argc, char **argv)
     CHECK(stp < 1500, "attack: a restart over a sounding note does not click (largest sample step %d)", stp);
     atk_w = T2_LO;
     double hfm[3], rmsm[3];
-    for (int c = 0; c < 3; c++) {                               /* full drive, hard: plain, tone closed, sub full */
-        sub(c == 2 ? 32767 : 0); tone(c == 1 ? 0 : 32767); reset(); set(SINE, 0, 0, 6000, 32767, 32767, 127, 0); on(0, 55, 127); run_ms(600);
+    for (int c = 0; c < 3; c++) {                               /* full drive, hard (75 %: 100 % slams the clipper, which squares a dark wall
+                                                                 * bright again): plain, tone closed, sub full */
+        sub(c == 2 ? 32767 : 0); tone(c == 1 ? 0 : 32767); reset(); set(SINE, 0, 0, 6000, 32767, 24576, 127, 0); on(0, 55, 127); run_ms(600);
         double e = 0, de = 0;
         for (size_t i = at(300); i < rec_n; i++) { e += (double)rec[i] * rec[i]; de += (double)(rec[i] - rec[i - 1]) * (rec[i] - rec[i - 1]); }
         hfm[c] = de / e; rmsm[c] = sqrt(e / (rec_n - at(300)));
@@ -442,6 +452,13 @@ int main(int argc, char **argv)
     shift_turn(2, -100 * 1024);
     CHECK(host_eng_rec[0][REC_SUB] == 0, "sub stops at 0");
     CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_TURN, 0, 1024) == 0, "T2's turns are the OP-1's (it turns the envelope words)");
+    sag(0); host_eng_rec[0][REC_SUB] = 0; host_eng_rec[0][REC_GLIDE] = 0;
+    CHECK(orange_turn(-2 * 1024) == 1 && host_knobs[0][3] == 0 && host_eng_rec[0][REC_RISE] == 2048, "orange below 0: sag rises (record %d), the fall word stays 0", host_eng_rec[0][REC_RISE]);
+    orange_turn(5 * 1024);
+    CHECK(host_knobs[0][3] == 3072 && host_eng_rec[0][REC_RISE] == 0, "and back up through 0: the fall %d, the rise cleared", host_knobs[0][3]);
+    orange_turn(100 * 1024); const int top3 = host_knobs[0][3]; orange_turn(-200 * 1024);
+    CHECK(top3 == 32767 && host_knobs[0][3] == 0 && host_eng_rec[0][REC_RISE] == 32767 && host_eng_rec[0][REC_MODE] == MODE_GLIDE, "sag stops at 100 %% and -100 %%, the mode kept");
+    sag(0); rise(0);
     memset(host_eng_rec[0], 0, sizeof host_eng_rec[0]); mode(MODE_GLIDE);
 
     /* 12c. release (T2 orange) and the defaults of a slot with no T2 words */
@@ -505,7 +522,22 @@ int main(int argc, char **argv)
     CHECK(freq(at(500), at(700)) > fs1 * 1.1 && freq(at(500), at(700)) < 54, "sag at half falls less (%.1f Hz)", freq(at(500), at(700)));
     sag(0); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
     CHECK(fabs(freq(at(500), at(700)) - 55) < 0.3, "sag at 0: none (%.2f Hz)", freq(at(500), at(700)));
-    sag(0);
+    /* the law: 25 %% about 3 semitones over the decay's length, 50 %% 7, 75 %% 12, 100 %% 18. Decay 0.6 s here, word 16000:
+     * the note's length is the decay's (a fifth of it is the time constant), so measure 0.6 s on */
+    { const double want[4] = { 2.8, 6.75, 11.8, 18 }; double got[4];
+      for (int c = 0; c < 4; c++) {
+          sag((c + 1) * 8192 - (c == 3)); reset(); set(SINE, 0, 0, 16000, 0, 0, 127, 0); on(0, 55, 127); run_ms(700);
+          got[c] = 12 * log2(55 / freq(at(520), at(680)));
+      }
+      CHECK(fabs(got[0] - want[0]) < 1.2 && fabs(got[1] - want[1]) < 1.5 && fabs(got[2] - want[2]) < 2 && fabs(got[3] - want[3]) < 2.5,
+            "sag 25, 50, 75, 100 %%: %.1f, %.1f, %.1f, %.1f semitones down after the decay's length", got[0], got[1], got[2], got[3]); }
+    sag(0); rise(32767); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
+    const double fr0 = freq(0, at(60)), fr1 = freq(at(500), at(700)), fr2 = freq(at(1100), at(1260));
+    CHECK(fr0 > 55 && fr0 < 60 && fr1 > fr0 * 1.3 && fr2 < 110.5 && fr2 > 100, "sag at -100 %%: it rises, %.1f Hz at the start, %.1f half a second on, %.1f at the end (an octave up at most)", fr0, fr1, fr2);
+    wav("sag_rise");
+    rise(8192); reset(); set(SINE, 0, 0, 20000, 14000, 12000, 127, 0); on(0, 55, 127); run_ms(60); offk(0); run_ms(1200);
+    CHECK(freq(at(500), at(700)) > 56 && freq(at(500), at(700)) < fr1 * 0.9, "sag at -25 %%: rises less (%.1f Hz)", freq(at(500), at(700)));
+    rise(0); sag(0);
 
     /* the sound this was for: full feedback saw, a long deep knock, sag, drive up, the tone half closed */
     sag(20479); tone(18430); reset(); set(31500, 22000, 20000, 26000, 28000, 26000, 0, 0);
@@ -549,6 +581,16 @@ int main(int argc, char **argv)
     }
     CHECK(ch[1] > ch[0] * 2.5, "clip at the default drive: hard has %.1f times the treble of soft", ch[1] / ch[0]);
     CHECK(cr[0] < 0.85 && cr[1] > 0.93, "clip with no drive: a rounded sine at soft (rms %.2f), nearly square at hard (rms %.2f)", cr[0], cr[1]);
+    /* the last quarter slams it: at 100 %% the tail stays square far longer than at 75 %% */
+    { double tl[2];
+      for (int c = 0; c < 2; c++) {
+          reset(); set(SINE, 0, 0, 16000, 0, c ? 32767 : 24576, 127, 0); on(0, 55, 127); run_ms(80); offk(0); run_ms(1500);
+          double e = 0; for (size_t i = at(500); i < at(700); i++) e += (double)rec[i] * rec[i];
+          tl[c] = sqrt(e / (at(700) - at(500))) / 32768;
+          CHECK(peak(0, rec_n) <= 32768, "clip %s: inside 16 bits", c ? "100 %" : "75 %");
+          if (c) wav("clip_slam");
+      }
+      CHECK(tl[1] > tl[0] * 2.5, "clip 100 %% slams the clipper: the tail 0.5 s on is %.1f times louder than at 75 %% (rms %.2f)", tl[1] / tl[0], tl[1]); }
 
     /* 20. the sub is heard: blended in after the clipper, its clean sine takes over the low end as it goes up. Measured
      * as the share of the output that is a 55 Hz sine, at the default drive and at full drive, sine and saw. (Before
@@ -633,7 +675,9 @@ int main(int argc, char **argv)
     sag(32767); frame("flat: sag full"); double fw1, ht1; near_shape(&low, &fw1, &ht1);
     CHECK(fw1 > fw0 + 15 && ht1 < ht - 6 && low > -0.6 && low < 0.6, "sag flattens the bottom onto the road: %.1f px of it on the road (%.1f round), %.1f px lower", fw1, fw0, ht - ht1);
     CHECK(fabs(vis_hub_y / 1024.0 + (last_wheel.rout - last_wheel.q) / 1024.0 - CON_Y) < 0.6, "and the flat stays on the road");
-    sag(0);
+    sag(0); rise(32767); frame("blown up: sag -100 %"); double fw2, ht2; near_shape(&low, &fw2, &ht2);
+    CHECK(ht2 > ht + 4 && low > -0.6 && low < 0.6, "sag below 0 blows the tyre up: %.1f px taller (contact %.1f px, %.1f round), still on the road (%.2f)", ht2 - ht, fw2, fw0, low);
+    rise(0);
     sub(0); frame("sub 0: a plain dish");
     CHECK(vis_spokes == 0 && !vis_whitewall && !vis_spinner, "sub 0: no spokes, no whitewall, no spinner");
     sub(9830); frame("sub 30 %: spokes growing");
@@ -659,7 +703,15 @@ int main(int argc, char **argv)
     }
     CHECK((rest - top) / 1024.0 > 5, "a note kicks the wheel off the road (%.1f px)", (rest - top) / 1024.0);
     CHECK(shadow >= 2, "and its shadow stays on the road");
-    CHECK(!offscreen, "nothing goes off the screen or below its lower margin, at the largest size, flat, lowrider, bouncing");
+    sag(0); rise(32767); vis_trig++;
+    for (int i = 0; i < 90; i++) {
+        frame(i == 6 ? "blown up: bounce" : "blown up, rolling");
+        for (int j = 0; j < nlines; j++) if (lines[j].y1 > OP1_Q10(150) || lines[j].y0 > OP1_Q10(150) || lines[j].x0 < OP1_Q10(2) || lines[j].x1 < OP1_Q10(2) || lines[j].x0 > OP1_Q10(318) || lines[j].x1 > OP1_Q10(318) || lines[j].y0 < OP1_Q10(2) || lines[j].y1 < OP1_Q10(2)) offscreen = 1;
+        for (int q = 0; q < npolys; q++) for (int j = 0; j < polys[q].n; j++) if (polys[q].p[j].y > OP1_Q10(150) || polys[q].p[j].y < OP1_Q10(2) || polys[q].p[j].x < OP1_Q10(2) || polys[q].p[j].x > OP1_Q10(318)) offscreen = 1;
+        escapes += dyn_escapes();
+    }
+    rise(0); sag(32767);
+    CHECK(!offscreen, "nothing goes off the screen or below its lower margin, at the largest size, flat or blown up, lowrider, bouncing");
     host_knobs[0][1] = 32767; for (int i = 0; i < 40; i++) { frame("rough road, rolling"); escapes += dyn_escapes(); } host_knobs[0][1] = 20000;
     CHECK(escapes == 0 && dyn_from > 0, "no moving stroke or fill reaches the still label layer (%d escapes)", escapes);
     CHECK(ang != a0, "the wheel turns while a note sounds");
@@ -691,6 +743,8 @@ int main(int argc, char **argv)
     host_knobs[0][0] = 8192;
     host_knobs[0][2] = 32767; sag(32767); host_shift_held = 1; glide_rec(32767); frame("shift held, glide 500 ms"); host_shift_held = 0; frame("tone open, sag 100 %"); TEXT_SCAN(txt3, bad3, cor3); CHECK(!bad3, "the longest tone and sag values fit"); host_shift_held = 1; frame("shift held, glide 500 ms"); TEXT_SCAN(txt3, bad3, cor3);
     CHECK(!bad3, "the longest tone and glide values fit their corners");
+    host_shift_held = 0; sag(0); rise(32767); frame("sag -100 %"); TEXT_SCAN(txt3, bad3, cor3); rise(0);
+    CHECK(!bad3, "sag -100 %% fits, with its sign");
     host_shift_held = 0;
 
     /* the T2 page: the envelope curve and four labels */
