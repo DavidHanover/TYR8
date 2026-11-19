@@ -19,6 +19,10 @@ installed through the Hundekraft workshop.
    connect the OP-1 by USB.
 3. Under **Your plugins**, add `tyr8.knl`. Press **Review changes**, then **Send to OP-1**, then **T1** on the OP-1.
 4. After it restarts: **synth → Shift + T1 → tyr8**.
+5. Check the slot's play mode: **Shift + T2** opens the OP-1's play mode page. Use **poly** or **mono**, not
+   **unison**. A slot keeps the play mode of whatever sound it had before, and in unison the OP-1 steals and fades
+   its voices on every key, so every note clicks, and releasing a key doesn't retrigger the one held under it. TYR8
+   does its own mono either way (push orange for MONO GLIDE or MONO RETRIG).
 
 To update, add the newer file the same way; it replaces the old one. To remove it, use **Remove** under **Your
 plugins**. Sounds saved with tyr8 keep their name and come back if you reinstall.
@@ -35,8 +39,8 @@ encoder's colour shows its name and setting.
 |---|---|---|
 | Blue | `SHAPE`: the wave. 0 % sine, 50 % triangle, 100 % saw; below 0 % and above 100 % the output feeds back into the oscillator, until there is no steady pitch | `DRIVE`: distortion before the clipper, up to 30 dB: fatter, then gritty. **Shift + push blue** switches this to `CLIP`, the final clipper from a rounded soft clip to a hard brick wall (squarer and brighter); its last quarter slams it, up to 16x at 100 %; push again for drive |
 | Green | `KNOCK`: how far the pitch starts above the note before dropping onto it, up to 16 times its frequency | `KNOCK LEN`: how long that drop takes, 20 ms (a click) to 1.5 s (a slow dive) |
-| White | `TONE`: a low-pass after the drive. 100 % is open; lower is darker, down to 140 Hz | `SUB`: blends a clean sine at the note in after the clipper, so it stays clean: more weight, less grit. At full it is 60 % of the output |
-| Orange | `SAG`, -100 to 100 %: above 0 the pitch falls while the note lasts (about 3 semitones over the decay at 25 %, 7 at 50 %, 12 at 75 %, 18 at 100 %); below 0 it rises the same way, up to an octave | `GLIDE`: how long the pitch slides between overlapping notes, 0 to 500 ms. `MONO GLIDE` only |
+| White | `TONE`: a low-pass after the drive. 100 % is open; lower is darker, down to 140 Hz | `SUB`: blends a clean sine in after the clipper, so it stays clean: an octave below the note, or at the note itself where an octave down would be under the OP-1's 35 Hz bus filter (it crossfades between them around 40 to 45 Hz). At full it is the whole output |
+| Orange | `SAG`, -100 to 100 %: above 0 the pitch falls while the note lasts (about 2 semitones over the decay at 25 %, 4 at 50 %, 7 at 75 %, 11 at 100 %); below 0 it rises, up to about 7 semitones at -100 % | `GLIDE`: how long the pitch slides between overlapping notes, 0 to 500 ms. `MONO GLIDE` only |
 
 **Push orange** (with or without Shift) to switch between the two play modes. The current one is shown under orange's label.
 
@@ -77,8 +81,10 @@ a curb, a sidewalk and grass behind it, all scrolling past. Each part follows a 
 ### Good to know
 
 - **Pitch:** the engine sounds two octaves below the key, so the OP-1's octave 0 is already bass.
-- **Loudness:** the clipper is always last for everything but the sub, and always driven, so the output is at full
-  scale at any setting. Drive and clip add density, not peak level. Turning the sub up trades some density for
+- **Loudness:** the clipper is always last for everything but the sub, and always driven, so the output is at the
+  same peak level at any setting: 4 dB under full scale. The OP-1's synth bus has a 35 Hz high-pass after the
+  synths, and a square-ish bass through it overshoots by up to 6 dB; at full scale every note clipped (at -4 dB a hard-driven note can still touch it). Drive and clip
+  add density, not peak level. Turning the sub up trades some density for
   weight: about 2 dB less loudness at full.
 - **Saving:** every value above, and the play mode, is saved with the sound. Whether Shift + blue is on drive or
   clip is not.

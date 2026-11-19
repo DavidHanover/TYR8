@@ -22,10 +22,10 @@ grows treads with the sound.
 
 | Thing | State |
 |---|---|
-| Source | Branch `tyr8-0.9.12` (pushed): 0.9.9, 0.9.11 and 0.9.12 on top of `e6a25ca` (0.9.3). `main` is still at 0.9.3. |
+| Source | Branch `experimental` (0.9.14 .. 0.9.20, tag `v0.9.20`) on top of `tyr8-0.9.13`. `main` is still at 0.9.3. |
 | Not tried on hardware | Most of 0.9.4 to 0.9.9: the T2 page, the Shift-turn takeover, the code-drawn screen (pixel fills), the tail fade. The owner tests by ear on their OP-1. |
-| Host checks | 154 pass (`./build.sh test`). |
-| Plugin file | `build/tyr8.knl`, 44,068 bytes, version 0.9.12, built with Blackfin GCC 13.3.0. Not committed (`build/` is ignored). |
+| Host checks | 165 pass (`./build.sh test`). |
+| Plugin file | `build/tyr8.knl`, 48,292 bytes, version 0.9.20, built with Blackfin GCC 13.3.0. Not committed (`build/` is ignored). |
 | GitHub release | **Not created.** The README links to the releases page, which is empty. The owner was going to make a release with `tyr8.knl` attached (planned as `v0.9.3`; the code is now 0.9.9). There is no `gh` CLI on this machine. |
 | Reddit post | Drafted in `build/reddit_post.md` (ignored). Has two placeholders: the demo clip and a "Tested on" line. |
 | Demo video | `build/tyr8_demo.mp4` (302 MB) and `build/tyr8_demo_reddit.mp4` (48 MB). See section 12. |
@@ -147,7 +147,8 @@ These come from the SDK docs and from mistakes made in this session.
 - Use `op1_sin_tab()` / `op1_sin_q()` for sine lookups **from `render` only**. From `note_on` or a screen, use
   `OP1_SINE_TABLE` directly. The screen code does.
 - The synth bus has a **35 Hz high-pass** after the voices. Nothing an engine does can get sub below that out.
-- A voice's output is `int16`. **There is no way to exceed full scale.** When the owner asks for "louder", the
+- A voice's output is `int16`. **There is no way to exceed full scale**, but the bus's 35 Hz high-pass after it
+  overshoots a square-ish note by up to 6 dB, so TYR8 peaks at -4 dB (`OUT_GAIN`), a compromise: an ordinary note's onset can still go ~1.5 dB over. When the owner asks for "louder", the
   only levers are density (drive, clip) and the OP-1's own mixer.
 
 ### Threads
@@ -267,12 +268,18 @@ Per sample:
    - treble lift: the part above about 220 Hz again, 0 to 3×;
    - stage 2: gain 1 to 4×, then a saturation whose knee follows the clip knob.
 7. **Tone.** Two one-pole low-passes in series, 12 kHz down to about 190 Hz. Exactly bypassed when open.
-8. **Sub blend.** Crossfade toward the clean sine, up to 75 %.
+8. **Sub blend.** Crossfade toward the clean sine, all the way at full (`SUB_MAX` 2048; it was 60 % in 0.9.7 to
+   0.9.13). From 0.9.14 the sine is an octave down, from the phase's 33rd bit (`ph_h`, toggled when `ph` wraps), while
+   that is at 45 Hz or more; at 40 Hz and under it is at the note (the bus's 35 Hz high-pass). `ow`, Q12, crossfades
+   the two, from the note's increment with glide and sag (not the knock), eased a block and ramped a sample.
 9. **Feedback tap.** Taken here through a fixed soft clip, so the clip knob does not change how wild feedback is.
 10. **Clipper, always last.** Driven 1.76× (soft) to 4× at 75 %, then the last quarter slams it, up to 16× at
     100 % (`slam`, squared; for that the multiply drops to Q8, `csh`, so it stays in 32 bits); the knee goes from the cubic soft clip
     `x − (4/27)x³` to a brick wall. The 1.76× is chosen so that a plain sine with no drive just reaches the
-    ceiling: the output is at full scale at every setting.
+    ceiling: the output is at its ceiling at every setting. The ceiling is `OUT_GAIN`, -4 dB (0.9.20; full scale up to
+    0.9.16, -6.5 dB in 0.9.17 .. 0.9.19, too quiet): the bus's 35 Hz high-pass throws a full-scale square-ish note up to 6.2 dB over (the doom patch,
+    two poles), and the OP-1 showed red and clicked on every note. The host test records `rec` scaled back up to
+    full scale, so its level checks read against the ceiling; `raw_peak` is what the OP-1 gets.
 11. **Attack.** A linear fade of the finished signal, 0 to 100 ms.
 12. **Restart declick.** On the first sample of a restart, `tail` is set to the difference from the last output
     sample and fades over 1.5 ms, so a note that cuts off a sounding one is continuous.
@@ -284,8 +291,9 @@ Per sample:
     ~600 ms of a tail, a staircase of a few output levels, audible as digital noise.
 
 **Sag** multiplies the frequency by a factor (Q29, `ONE29`) that shrinks every block, or grows below 0, so pitch
-moves linearly in octaves over time: 0.75 (u + u²) octaves over the amp decay's length at |sag| = u (25 % about 3
-semitones, 100 % 18), stopping three octaves down or one up. It resets on a restart. Up to 0.9.12 it was two octaves
+moves linearly in octaves over time: 0.75 (u + u²) octaves over the amp decay's length, u = 0.7 sag falling and
+0.5 |sag| rising (25 % about 1.9 semitones, 100 % 10.7, -100 % 6.75 up; from 0.9.18, the owner's useful -50 .. 70 %
+of 0.9.13's law spread over the whole knob), stopping three octaves down or one up. It resets on a restart. Up to 0.9.12 it was two octaves
 at 100 %, linear in the knob, and the owner found it mostly over by a third of the turn.
 
 ### 5.4 Fixed-point formats
@@ -333,8 +341,12 @@ the raster's pixels** (`fill_poly`, even-odd scanline, RGB565, the layout dx_gfx
 - **Flat (sag):** in `wp()`, tyre points (beyond the rim) below a floor are pushed onto it and the low sidewall
   bulges along the road; the hub drops by the same amount so the flat sits on the road. The rim is drawn with an
   unflattened copy of the wheel, so it stays round. Below 0 (`inf`, up to 15 % of the sidewall) the tyre is blown
-  up instead: points beyond the rim move out by `inf` at the tread, and the faces balloon out along the depth,
-  most mid-wall; the hub rises by `inf` so it still sits on the road.
+  up instead: points beyond the rim move out by `inf` at the tread (up to 16 % of the radius), and the faces balloon
+  out along the depth, most mid-wall and less low down (so the wall doesn't dip into the road); the hub rises by
+  `inf` so it still sits on the road. From -60 % a blister (`bl`, at `ba`, turning with the tyre, left out where it
+  would push into the road), from -70 % a quiver along the road (a sideways one lifts it off the diagonal road), from
+  -80 % the sidewall line in red (`strain`). `inf + bl` is held so the largest tyre grows at most 7 px (the screen's
+  top).
 - **Spokes (sub):** 0 to 40 laced spokes (`vis_spokes`), whitewall above 50 %, gold spinner above 80 %, five lug
   nuts while there are fewer than 12 spokes.
 - **Size:** decay, 0.55 to 0.92. **Spin, bounce, ridges:** as before, the ridges on the road's cross lines.

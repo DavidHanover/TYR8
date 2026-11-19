@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.20
+- README: set the OP-1's own play mode (Shift + T2) to poly or mono, not unison. Unison was behind the clicks on
+  every note and the missing retrigger knock found on hardware; a slot keeps the play mode of its previous sound.
+- The output is 2.5 dB louder, peaking at -4 dB (0.9.17's -6.5 was too quiet). After the OP-1's 35 Hz bus high-pass
+  an ordinary note may now go about 1.5 dB over at its onset, the heaviest patches about 2 (they went 5.5 and 6 over
+  at full scale).
+
+## 0.9.19
+- Below 0 the tyre is blown up much further, on the verge of bursting: the tread out by up to 16 % of the radius
+  (a mid-size tyre about 10 px taller), the sidewalls ballooning, from -60 % a blister swelling on the tread (it turns
+  with the tyre), from -70 % a quiver, from -80 % the sidewall line strained red. The largest tyre is held to 7 px
+  more so it stays on the screen.
+
+## 0.9.18
+- SAG's knob is spread over what was useful: 100 % is 0.9.17's 70 % (about 11 semitones down over the decay) and
+  -100 % its -50 % (about 7 up), the same curve between.
+
+## 0.9.17
+- Fixed: every note clipped on the OP-1 (red, a click). TYR8 sent out a square-ish bass at full scale, and the synth
+  bus's 35 Hz high-pass after it throws the edges and the onset up to 6 dB over. The output now peaks at -6.5 dB, so it
+  is 6.5 dB quieter; turn the OP-1's volume up to match.
+
+## 0.9.16
+- Fixed: with the OP-1 starting more than one voice a key (unison), no note after the first restarted (no knock, a
+  glide from the old pitch instead) until the last tail had died away. The voices of one press were taken as a key
+  held under another. Now only a key pressed before this one, and still down, makes a note legato.
+- Fixed: a restart over a loud tail could add up past full scale and wrap into a click; the output is held at full
+  scale.
+
+## 0.9.15
+- SUB is an octave down: a clean sine at half the note's pitch, while that is at 45 Hz or more. Where it would fall
+  under the synth bus's 35 Hz high-pass it stays at the note's own pitch (40 Hz and under), with a crossfade between,
+  ramped so a glide or a sag through it doesn't click. It follows glide and sag, not the knock.
+- SUB goes all the way: at 100 % the output is only the clean sine (it stopped at 60 %).
+
 ## 0.9.13
 - SAG goes from -100 % to 100 %. Below 0 the pitch rises while the note lasts (up to an octave), and the tyre blows
   up: taller, its sidewalls ballooning out. Sounds saved before keep their sag.
