@@ -30,6 +30,9 @@ static void mode(int m) { host_eng_rec[0][0] = (int16_t)m; host_eng_rec_owner[0]
 static int tone_w = 32767, atk_w = T2_LO, rel_w = T2_HI;   /* tone open, no attack, release HOLD */
 static int active[6]; static double key_hz[6];      /* the key's own frequency, as the firmware gives it */
 static int16_t *rec; static size_t rec_n, rec_cap; static int raw_peak;
+static unsigned out_voices;        /* which voices put out sound since it was cleared */
+static int multi_blocks;           /* blocks in which more than one voice put out sound */
+static int kill_voice = -1;        /* a voice the OP-1 has killed: not rendered */
 static uint32_t audio_hash = 2166136261u;
 static int rec_get_mode(void);     /* FNV-1a over every sample rendered: a speed-up must leave it as it was */
 
@@ -64,6 +67,7 @@ static int orange_turn(int delta)
 static void reset(void)
 {
     memset((void *)held, 0, sizeof held); owner = -1; memset(tv, 0, sizeof tv);
+    rv = -1; own_v = -1; own_stamp = 0; rv_stale = 0;
     memset(active, 0, sizeof active); rec_n = 0;
 }
 static void on(int v, double f, int velocity)
@@ -73,13 +77,15 @@ static void run_ms(double ms)
 {
     int blocks = (int)(ms * 88.2 / 128 + 0.5);
     for (int b = 0; b < blocks; b++) {
-        int32_t sum[128] = { 0 }; int16_t o[128];
+        int32_t sum[128] = { 0 }; int16_t o[128]; unsigned out_voices_blk = 0;
         for (int v = 0; v < 6; v++) {
             if (!active[v]) continue;
             if (ENGINE_tyr8.ext.finished(OP1_VOICE(v))) { active[v] = 0; continue; }
             for (int n = 0; n < 128; n++) host_pitch_inc[n] = (int32_t)(key_hz[v] / 88200.0 * 4294967296.0);
+            if (v == kill_voice) continue;
             ENGINE_tyr8.ext.voice.render(OP1_VOICE(v), o, P);
-            for (int n = 0; n < 128; n++) sum[n] += o[n];
+            int any = 0; for (int n = 0; n < 128; n++) { sum[n] += o[n]; any |= o[n]; }
+            if (any) { if (out_voices_blk) multi_blocks++; out_voices_blk |= 1u << v; out_voices |= 1u << v; }
         }
         if (rec_n + 128 > rec_cap) { rec_cap = rec_cap ? rec_cap * 2 : 1 << 20; rec = realloc(rec, rec_cap * 2); }
         /* recorded as if at full scale (x 32767 / OUT_GAIN), so the checks read levels against the voice's own ceiling;
@@ -385,6 +391,24 @@ int main(int argc, char **argv)
         offk(0); offk(1); run_ms(2000);
     }
     mode(MODE_GLIDE);
+
+    /* 7g. poly, legato presses: the sound stays on one OP-1 voice the whole time (the OP-1 made a move to the new key's
+     * voice a click), following each new key's pitch and restarting with its knock */
+    { mode(MODE_RETRIG); reset(); set(SINE, 20000, 3000, 26000, 14000, 12000, 127, 0);
+      out_voices = 0; multi_blocks = 0;
+      const double hz[5] = { 55, 82, 61, 73, 49 }; double got[5]; unsigned trig = vis_trig;
+      for (int i = 0; i < 5; i++) { on(i, hz[i], 127); run_ms(20); if (i) offk(i - 1); run_ms(180); got[i] = freq(rec_n - at(100), rec_n); }
+      CHECK(out_voices == 1u && multi_blocks == 0, "poly, five legato presses: the sound stays on its first voice (voices %#x, %d blocks with two)", out_voices, multi_blocks);
+      int ok = vis_trig - trig == 5; for (int i = 0; i < 5; i++) ok &= fabs(got[i] - hz[i]) < 1;
+      CHECK(ok, "and plays each new key: %.1f %.1f %.1f %.1f %.1f Hz, %u restarts", got[0], got[1], got[2], got[3], got[4], vis_trig - trig);
+      offk(4); run_ms(4000);
+      CHECK(!active[0] && !active[4], "when it has died away its voice is freed (voice 0 %d, 4 %d)", active[0], active[4]);
+      out_voices = 0; on(2, 55, 127); run_ms(100);
+      CHECK(out_voices == 1u << 2, "and the next note plays on its own key's voice (%#x)", out_voices);
+      /* the OP-1 kills the sound's voice (a steal, a shed): the owner takes the sound over */
+      on(3, 82, 127); run_ms(50); offk(2); kill_voice = 2; out_voices = 0; run_ms(200); kill_voice = -1;
+      CHECK(out_voices == 1u << 3 && fabs(freq(rec_n - at(100), rec_n) - 82) < 1, "its voice killed, the newest key's voice takes the sound over (%#x, %.1f Hz)", out_voices, freq(rec_n - at(100), rec_n));
+      offk(3); run_ms(4000); mode(MODE_GLIDE); }
 
     /* 8. retrigger over a sounding note: restart without a click */
     reset(); set(SINE, 0, 0, 20000, 0, 0, 0, 0);

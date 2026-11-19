@@ -227,6 +227,13 @@ Since 0.9.4 there are no push pages. The layout was the owner's own design (2026
 
 ### 5.2 Key tracking and play modes
 
+- **One voice for the sound (0.9.24):** the sound renders on `rv`, the OP-1 voice it started on, until it has died
+  away (`ty_finished` keeps `rv` while `tv[0].live`); every other voice renders zeros. `owner`, the newest key's
+  voice, copies what only its own render can read into `own_inc` (its pitch increments), `own_vel` and `own_stamp`
+  (its note), and `rv` renders with those. Moving the sound to every new key's voice (up to 0.9.23) clicked on the
+  OP-1 on every press in poly, legato too. If `rv` stops rendering (the OP-1 killed it) the owner takes over after two
+  of its renders without one of `rv`'s between.
+
 The firmware allocates six voices and calls `note_on(self)` / `note_off(self)` per voice. The engine's own sound
 state is **not** in the firmware's voice objects; it is the static array `tv[6]` of `voice_t`.
 

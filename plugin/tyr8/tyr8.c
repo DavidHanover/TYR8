@@ -62,7 +62,19 @@ static volatile uint32_t stamp[OP1_VOICES];   /* note-on order: the newest held 
 static volatile uint32_t beat[OP1_VOICES];    /* render call count when the voice last rendered: is it still alive */
 static volatile uint32_t on_at[OP1_VOICES];   /* render call count at its note-on: voices on at the same count are one press */
 static volatile uint32_t stamp_next = 1, calls;
-static volatile int8_t   owner = -1;          /* the voice that sounds */
+static volatile int8_t   owner = -1;          /* the newest key's voice: its pitch, velocity and notes */
+/* The sound plays on one OP-1 voice for as long as it rings (rv), whichever key owns it: up to 0.9.23 it moved to
+ * every new key's voice, and the OP-1's handling of each voice's output made that move a click on every press (poly,
+ * legato too; the OP-1's mono, one voice, never clicked). The owner hands over what only its own render can read: its
+ * pitch increments, its velocity, and which note it is. The renderer takes a new note once the owner has rendered it,
+ * so a renderer that goes first in the OP-1's voice order plays it a block (1.45 ms) later */
+static int8_t   rv = -1;                      /* the voice the sound plays on */
+static int32_t  own_inc[OP1_BLOCK];           /* the owner's increments, its last render */
+static int32_t  own_vel = 32767;
+static uint32_t own_stamp;                    /* its note then */
+static int8_t   own_v = -1;                   /* and which voice it was */
+static uint32_t rv_seen;                      /* the renderer's beat at the owner's last render */
+static uint8_t  rv_stale;                     /* owner renders in a row with no render of rv between: rv is gone */
 
 /* ---- the engine's record, saved with the sound: values the eight words have no room for. 0 is each one's default ----
  *   [0] play mode (the orange push steps it)
@@ -216,8 +228,12 @@ static int ty_finished(void *self)
 {
     const int v = op1_voice_index(self);
     if (v < 0 || v >= OP1_VOICES) return 1;
-    if (v != owner) return !held[v];
-    return stamp[v] == tv[0].seen_stamp && !tv[0].live;
+    if (v == rv) {                                             /* the sound's voice: until it has died away, and */
+        if (!tv[0].live && own_stamp == tv[0].seen_stamp && (owner < 0 || stamp[owner] == own_stamp)) { rv = -1; return 1; }
+        return 0;                                              /* no new note is waiting */
+    }
+    if (v == owner) return !held[v] && stamp[v] == own_stamp && own_stamp == tv[0].seen_stamp;   /* its note taken in */
+    return !held[v];
 }
 
 /* ---- the per-sample loop ----
@@ -368,14 +384,24 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     int16_t rc[REC_N];
     rec_get(op1_current_slot(), rc);
     const int mode = rc[REC_MODE];
-    if (v < 0 || v >= OP1_VOICES || v != owner) {              /* a key under the sounding one is silent */
-        if (v >= 0 && v < OP1_VOICES) beat[v] = calls;
+    if (v < 0 || v >= OP1_VOICES) { for (int n = 0; n < OP1_BLOCK; n++) out[n] = 0; return; }
+    beat[v] = calls;
+    if (v == owner) {                                          /* the owner hands over what only it can read */
+        const int32_t *pi = OP1_PITCH_INC;
+        for (int n = 0; n < OP1_BLOCK; n++) own_inc[n] = pi[n];
+        own_vel = op1_voice_vel_gain(self); own_stamp = stamp[v]; own_v = (int8_t)v;
+        if (rv >= 0 && rv != v) {                              /* the renderer still rendering? */
+            if (beat[rv] == rv_seen) { if (++rv_stale >= 2) rv = -1; }
+            else { rv_seen = beat[rv]; rv_stale = 0; }
+        }
+        if (rv < 0) { rv = (int8_t)v; rv_seen = beat[v]; rv_stale = 0; }
+    }
+    if (v != rv || own_v < 0) {                                /* every voice but the sound's is silent */
         for (int n = 0; n < OP1_BLOCK; n++) out[n] = 0;
         return;
     }
-    beat[v] = calls;
     voice_t *const t = &tv[0];
-    const int32_t *inc = OP1_PITCH_INC;
+    const int32_t *inc = own_inc;
     int32_t env[4];
     t2_get(op1_current_slot(), env);
     const int32_t sus = env[T2_SUSTAIN] * 32768;               /* Q30 */
@@ -383,7 +409,7 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     /* sag, signed: the fall (word 3) or, with none, minus the rise (the record) */
     const int32_t sag = q15(params[3]) ? q15(params[3]) : -rc[REC_RISE];
     const int32_t atk_ms = attack_ms(env[T2_ATTACK]);
-    const int gate = held[v];
+    const int gate = held[own_v];                              /* the owner's key */
 
     /* ---- once a block: knob laws ---- */
     /* shape, four quarters of the knob (shown as -50 .. 150 %, so that the plain waves are 0, 50 and 100): sine with feedback (most at the bottom) .. sine | .. triangle | .. saw |
@@ -412,10 +438,10 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     const int32_t cg = 1802 + ((2294 * clip) >> 12) + ((slam * slam * 12) >> 10);   /* Q10, 1.76 .. 16x */
 
     /* a new note for this voice */
-    if (stamp[v] != t->seen_stamp) {
-        t->seen_stamp = stamp[v];
+    if (own_stamp != t->seen_stamp) {
+        t->seen_stamp = own_stamp;
         const int32_t slide = glide && t->last_inc ? t->last_inc - (inc[0] >> OCT_DOWN) : 0;   /* from the last pitch */
-        if (mode == MODE_GLIDE && legato_req[v] && t->live && t->lvl > AUDIBLE) {
+        if (mode == MODE_GLIDE && legato_req[own_v] && t->live && t->lvl > AUDIBLE) {
             t->off = slide;                                    /* legato: no restart, the pitch slides */
         } else {                                               /* restart: phase 0, both envelopes from the top */
             t->restart = t->live ? 2 : 1;
@@ -427,8 +453,8 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
             t->lvl = ONE30;
             t->pe = ONE30;
             t->off = 0;
-            t->vel = op1_voice_vel_gain(self);
-            if (v == owner) vis_trig++;
+            t->vel = own_vel;
+            vis_trig++;
         }
         t->live = 1;
     }
@@ -580,10 +606,8 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     t->last_inc = (inc[OP1_BLOCK - 1] >> OCT_DOWN) + o;
     if (t->lvl == 0 && (t->tail >> 11) == 0) t->live = 0;
 
-    if (v == owner) {                                          /* the screen follows the newest note */
-        vis_inc = (uint32_t)t->last_inc;
-        vis_lvl = t->lvl >> 15;
-    }
+    vis_inc = (uint32_t)t->last_inc;                           /* the screen follows the sound */
+    vis_lvl = t->lvl >> 15;
 }
 
 /* the engine's T1 page (KeyHandler thread). A plain turn is the OP-1's (words 0..3). Every Shift + turn is taken

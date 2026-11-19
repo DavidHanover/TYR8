@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.24
+- Fixed: a click on every key press in the OP-1's poly mode, legato too, at any setting. TYR8 is mono and moved its
+  one sound to each new key's OP-1 voice, and the OP-1's handling of each voice's output made the move audible (its
+  mono mode, one voice, never clicked). The sound now stays on one voice for as long as it rings; the newest key hands
+  over its pitch, velocity and note. A note can come one audio block (1.45 ms) later than its key, depending on the
+  OP-1's voice order.
+
 ## 0.9.23
 - Fixed: on a blown-up slick the red strain line still stuck out of the tyre by half its width (the outline ran
   through its middle). The outline now takes it in with 2 px to spare, and a flat's valve tip stays 2 px inside.
