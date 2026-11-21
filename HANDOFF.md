@@ -1,7 +1,7 @@
 # TYR8 handoff
 
-For the next agent or person who picks this up. Written 2026-11-16 at version 0.9.3, by the agent that built it
-with the owner over one long session. Read sections 1 to 4 before touching anything; the rest is reference.
+For the next agent or person who picks this up. First written 2026-11-16 at version 0.9.3; brought up to date at
+0.9.40 (2026-11-21). Read sections 1 to 4 before touching anything; the rest is reference.
 
 ---
 
@@ -22,12 +22,12 @@ grows treads with the sound.
 
 | Thing | State |
 |---|---|
-| Source | Branch `experimental` (0.9.14 .. 0.9.20, tag `v0.9.20`) on top of `tyr8-0.9.13`. `main` is still at 0.9.3. |
-| Not tried on hardware | Most of 0.9.4 to 0.9.9: the T2 page, the Shift-turn takeover, the code-drawn screen (pixel fills), the tail fade. The owner tests by ear on their OP-1. |
-| Host checks | 165 pass (`./build.sh test`). |
-| Plugin file | `build/tyr8.knl`, 48,292 bytes, version 0.9.20, built with Blackfin GCC 13.3.0. Not committed (`build/` is ignored). |
-| GitHub release | **Not created.** The README links to the releases page, which is empty. The owner was going to make a release with `tyr8.knl` attached (planned as `v0.9.3`; the code is now 0.9.9). There is no `gh` CLI on this machine. |
-| Reddit post | Drafted in `build/reddit_post.md` (ignored). Has two placeholders: the demo clip and a "Tested on" line. |
+| Source | `main` at 0.9.40, tag `v0.9.40` (commit `00f6e88`). The branches `experimental`, `sample-layer` and `tyr8-0.9.x` are merged history. |
+| On hardware | The owner tests every build by ear on their OP-1; 0.9.40 sounds right to them. Still unverified as raw reads: the sampler's engine type, rate and knob words 4 and 7 (section 5, Sample layer), each with a safe fallback. |
+| Host checks | 219 pass (`./build.sh test`). |
+| Plugin file | `build/tyr8.knl`, 62,196 bytes, version 0.9.40, built with Blackfin GCC 13.3.0. Not committed (`build/` is ignored). |
+| GitHub release | Tags `v0.9.24` and `v0.9.40` are pushed. The owner makes the release pages in the browser and attaches `tyr8.knl`; check that `v0.9.40`'s has it. |
+| Reddit post | The current one, for TYR8 and UZ-1 together, is in the UZ-1 repo: `build/out/reddit_post.md` (ignored). |
 | Demo video | `build/tyr8_demo.mp4` (302 MB) and `build/tyr8_demo_reddit.mp4` (48 MB). See section 12. |
 
 ### What has and has not been verified
@@ -192,7 +192,9 @@ One file, two halves. The top comment in the file is accurate as of this handoff
 
 ### 5.1 Controls and where they are stored
 
-Since 0.9.4 there are no push pages. The layout was the owner's own design (2026-11-17).
+The layout is the owner's own design. From 0.9.25 the pushes switch pages (blue's SHAPE / DRIVE, green's knock / sample,
+white's tone / sample tone, all with or without Shift, none saved); the table shows each knob's first page, the bullets
+below the others.
 
 | Encoder | T1 turn (word) | T1 Shift + turn | T2 (R246's envelope words) |
 |---|---|---|---|
@@ -209,10 +211,11 @@ Since 0.9.4 there are no push pages. The layout was the owner's own design (2026
   turn. Words go through `op1_engine_word_set`, record values through `op1_engine_record_store`.
   `op1_engine_shift` is no longer called.
 - **Pushes:** a T2 orange push steps the play mode (record 0), shown under RELEASE on T2 (0.9.36; it was a T1 orange
-  push, shown under orange's T1 block); a T1 orange push does nothing. A blue push (either way) toggles `blue_pg`, a
+  push, shown under orange's T1 block); a plain T1 orange push does nothing, Shift + orange toggles the tyre's markings (the easter egg, below). A blue push (either way) toggles `blue_pg`, a
   UI-only flag that is **not saved** (see Blue's pages below). Green (either way) toggles `green_smp`, also not saved: while it is on, the plain
   green turn is `SAMPLE` (record 8, `delta` a step) and Shift + green `SMP ATK` (record 13, `delta`; 0.9.35, it was
-  SMP TUNE), both taken by `ty_input`. White's push is taken and does nothing.
+  SMP TUNE), both taken by `ty_input`. White's push toggles `white_smp` (not saved): the plain white turn is then `S.TONE` (record 12)
+  and Shift + white `SMP HPF` (record 14).
 - **Sample layer (0.9.25).** `find_source` / `scan` are UZ-1's: the first other slot (or record 10's slot) whose
   sampler buffer has peaks over -42 dBFS, from just before its first loud sample to its last loud bucket. Scanned on
   the key thread in `ty_note_on` (only with `SAMPLE` up, at most every 64 render calls, or at once after
@@ -496,6 +499,11 @@ Useful for understanding why things are the way they are. Each item was a direct
 15. Digital noise on the decay tail → precision rework.
 16. The clip knob did nothing audible; verify the sub is always a sine.
 17. Repo, README, Reddit post, demo video.
+18. 0.9.13 .. 0.9.24: bipolar SAG, an octave-down SUB that can be all of the output, CLIP's slam, a quieter peak
+    (-4 dB) so notes stop clipping, the click on every poly key press fixed.
+19. 0.9.25 .. 0.9.40: a sample layer from another slot's sampler, following its trim, tune, gain and direction, with
+    its own HPF, tone and fade-in, pushes that switch pages, SAMPLE's top crossfading to the sample alone, SUB stepping
+    aside for it; the play mode on T2; a near sidewalk, grass and a yellow centre line; the tyre's markings.
 
 ---
 
@@ -589,7 +597,8 @@ changes as it decays and that looked like noise. Check what a metric is really m
   it permits gain above full scale.
 - **Going straight from sine to saw,** dropping the triangle, if the first half of the plain range still feels
   too subtle.
-- **A third value for orange.** Orange's push is the play mode, so it has no third knob value.
+- **A third value for orange.** Orange's T1 push is free from 0.9.36 (the play mode moved to T2; Shift + orange is the
+  easter egg), so a plain push could switch orange to a page of its own.
 - **Submitting the plugin to the Hundekraft workshop catalogue.** The maintainer accepts plugins and tests on
   hardware; that would reach more users than Reddit.
 
@@ -597,12 +606,11 @@ changes as it decays and that looked like noise. Check what a metric is really m
 
 ## 12. Release and promotion state
 
-- **GitHub release:** not made. Tag `v0.9.3`, title "TYR8 0.9.3", attach `build/tyr8.knl`, paste the
-  `CHANGELOG.md` entry. Rebuild first if anything changed; the committed source builds the 18,700-byte file.
-- **Reddit post:** `build/reddit_post.md`, for r/OP1users. Recommended as a video post with the write-up as the
-  first comment. Before posting: remove or fill the two placeholders, confirm the resource-monitor shortcut it
-  mentions (Shift + help, then T1; that comes from the op1r docs and was never confirmed on Hundekraft), and
-  make the release so the download link works.
+- **GitHub releases:** tags `v0.9.3`, `v0.9.9`, `v0.9.24` and `v0.9.40` are pushed. The owner makes each release page in
+  the browser, attaching `build/tyr8.knl` and pasting the `CHANGELOG.md` entries since the last one.
+- **Reddit post:** the current one, TYR8 0.9.40 and UZ-1 0.3.9 together, is in the UZ-1 repo's
+  `build/out/reddit_post.md` (ignored). The 0.9.3 one in `build/reddit_post.md` is history. The owner also keeps a
+  controls doc for oplug1.dev (written from the README's tables).
 - **Demo video:** the owner supplied `build/1116262026.mp4` (camera footage) and `build/Document 1.wav` (mastered
   audio). I replaced the audio and synced it:
   - The WAV starts 0.4189 s before the video's timeline; measured by cross-correlation and stable to half a
