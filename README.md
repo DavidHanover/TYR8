@@ -24,7 +24,7 @@ If you enjoy this, toss me some [cheddar](https://buymeacoffee.com/davidhanover)
 5. Check the slot's play mode: **Shift + T2** opens the OP-1's play mode page. Use **poly** or **mono**, not
    **unison**. A slot keeps the play mode of whatever sound it had before, and in unison the OP-1 steals and fades
    its voices on every key, so every note clicks, and releasing a key doesn't retrigger the one held under it. TYR8
-   does its own mono either way (push orange for MONO GLIDE or MONO RETRIG).
+   does its own mono either way (on T2, push orange for MONO GLIDE or MONO RETRIG).
 
 To update, add the newer file the same way; it replaces the old one. To remove it, use **Remove** under **Your
 plugins**. Sounds saved with tyr8 keep their name and come back if you reinstall.
@@ -39,17 +39,50 @@ encoder's colour shows its name and setting.
 
 | Encoder | Turn | Shift + turn |
 |---|---|---|
-| Blue | `SHAPE`: the wave. 0 % sine, 50 % triangle, 100 % saw; below 0 % and above 100 % the output feeds back into the oscillator, until there is no steady pitch | `DRIVE`: distortion before the clipper, up to 30 dB: fatter, then gritty. **Shift + push blue** switches this to `CLIP`, the final clipper from a rounded soft clip to a hard brick wall (squarer and brighter); its last quarter slams it, up to 16x at 100 %; push again for drive |
-| Green | `KNOCK`: how far the pitch starts above the note before dropping onto it, up to 16 times its frequency | `KNOCK LEN`: how long that drop takes, 20 ms (a click) to 1.5 s (a slow dive) |
-| White | `TONE`: a low-pass after the drive. 100 % is open; lower is darker, down to 140 Hz | `SUB`: blends a clean sine in after the clipper, so it stays clean: an octave below the note, or at the note itself where an octave down would be under the OP-1's 35 Hz bus filter (it crossfades between them around 40 to 45 Hz). At full it is the whole output |
+| Blue, SHAPE page | `SHAPE`: the wave. 0 % sine, 50 % triangle, 100 % saw; below 0 % and above 100 % the output feeds back into the oscillator, until there is no steady pitch | `CLIP`: the final clipper, from a rounded soft clip to a hard brick wall (squarer and brighter); its last quarter slams it, up to 16x at 100 % |
+| Blue, DRIVE page | `DRIVE`: distortion before the clipper, up to 30 dB: fatter, then gritty | `SMP TUNE`: the sample's tune, -24 to +24 semitones from the sampler's own, a semitone a detent |
+| Green | `KNOCK`: how far the pitch starts above the note before dropping onto it, up to 16 times its frequency | `KNCKLEN`: how long that drop takes, 20 ms (a click) to 1.5 s (a slow dive) |
+| White | `TONE`: a low-pass after the drive. 100 % is open; lower is darker, down to 140 Hz | `SUB`: blends a clean sine in after the clipper, so it stays clean: an octave below the note, or at the note itself where an octave down would be under the OP-1's 35 Hz bus filter (it crossfades between them around 40 to 45 Hz). At full it is the whole output, except while a sample plays: the sub steps aside for it, and above 75 % `SAMPLE` it fades out with the 808 |
 | Orange | `SAG`, -100 to 100 %: above 0 the pitch falls while the note lasts (about 2 semitones over the decay at 25 %, 4 at 50 %, 7 at 75 %, 11 at 100 %); below 0 it rises, up to about 7 semitones at -100 % | `GLIDE`: how long the pitch slides between overlapping notes, 0 to 500 ms. `MONO GLIDE` only |
 
-**Push orange** (with or without Shift) to switch between the two play modes. The current one is shown under orange's label.
+**Push green** (with or without Shift) to swap green over to the **sample layer**, and push again to swap back to
+the knock (which one is showing is not saved):
 
-| Mode | What it does |
-|---|---|
-| `MONO GLIDE` | One voice. A note played while another is held and still sounding does not restart: the pitch glides to it. Letting go glides back to the key still held. |
-| `MONO RETRIG` | One voice. Every note restarts on its own pitch with no glide. Letting go restarts the key still held. |
+| Green, swapped | Turn | Shift + turn |
+|---|---|---|
+| | `SAMPLE`: the level of a recording layered onto every new note, 0 (off) to 75 %; from 75 to 100 % the 808 fades out and the sample takes over (see below). It reads `SMP REV` when the sample plays backwards | `SMP ATK`: fades the sample in, 0 to 100 ms (a quarter of the turn is 6 ms, half 25 ms): rolls off its attack |
+
+**Push white** (with or without Shift) to swap white over to the sample's own sound, and push again for TONE and SUB (not saved either):
+
+| White, swapped | Turn | Shift + turn |
+|---|---|---|
+| | `S.TONE`: the sample's own low-pass, 100 % open down to 140 Hz, as TONE is for the note | `SMP HPF`: a high-pass on the sample before its drive, off at 0, then 30 Hz to 3 kHz: takes the sample's low end out so it sits on top of the 808 |
+
+The recording is one you make with the OP-1's own **sampler** on another synth slot: put the sampler on a free slot,
+record the attack you want (a kick's first 30 to 80 ms, a click, a snap), and TYR8 finds it. It plays the part
+between the sampler's own **start and end** points, so trim it on the sampler's page and TYR8 follows (on the next
+note). The silence before the sound is skipped, so it lands on the key. The sampler's **tune, gain and direction**
+are where TYR8's own controls start: at `SMP TUNE` 0 a key plays the sample at the pitch the sampler would play it on
+that key (it follows the key you play, the key itself, not TYR8's two octaves down), its gain (up to +24 dB, clipping at full scale as the sampler does) is what `SAMPLE` starts from, and
+its direction (forwards or reverse) is the way it plays. The sampler's loop and envelope don't
+apply: the trimmed part plays once. **On T2, push green** to pick the slot: `SMP AUTO` (the first other slot with a
+recording) or a slot of its own, 1 to 8. The line under `DECAY` shows which slot it plays, or `-` for none.
+
+The sample has its own copy of the drive (at the same setting), then its own tone (`S.TONE`), then `SMP ATK`'s
+fade-in (after the drive, so it fades the click however hard the drive is), and joins the note
+after TONE, before the clipper: DRIVE and CLIP shape it with the rest, so a driven kick gets a driven click, but
+TONE doesn't darken it. It plays whole however short the decay, restarts on every new note
+(retriggers too), and is not played by a glided legato note, as the knock isn't. The output's peak stays where it was,
+so a loud sample through the clipper pushes the body down for the few milliseconds it lasts. ATTACK (T2 blue) fades it
+in with everything else.
+
+**The top of `SAMPLE`, 75 to 100 %, is a crossfade.** The 808 (and its sub) fades out after its drive and tone,
+before the clipper, while the sample carries on through its own drive and the clipper. At 100 % TYR8 is a sample
+player: just the recording, through DRIVE and CLIP and everything else of the sample's. If no recording is found, the
+note plays as usual.
+
+**Push blue** (with or without Shift) to switch blue between its SHAPE page and its DRIVE page; the label shows
+which one it is on (not saved).
 
 ### T2: envelope
 
@@ -66,10 +99,17 @@ TYR8 draws its own envelope page, with the curve in the encoders' colours.
 however short the key press. The T2 values are stored with the sound like any OP-1 envelope, so a sound starts with
 whatever envelope the slot had before; set those two first.
 
+**On T2, push orange** to switch between the two play modes. The current one is shown under `RELEASE`.
+
+| Mode | What it does |
+|---|---|
+| `MONO GLIDE` | One voice. A note played while another is held and still sounding does not restart: the pitch glides to it. Letting go glides back to the key still held. |
+| `MONO RETRIG` | One voice. Every note restarts on its own pitch with no glide. Letting go restarts the key still held. |
+
 ### The screen
 
 A tyre rolls along an isometric street that runs the whole diagonal of the screen, between the labels: the road,
-a curb, a sidewalk and grass behind it, all scrolling past. Each part follows a setting:
+its yellow centre line, a curb, a sidewalk and grass on each side, all scrolling past. Each part follows a setting:
 
 | What you see | Follows |
 |---|---|
@@ -77,7 +117,7 @@ a curb, a sidewalk and grass behind it, all scrolling past. Each part follows a 
 | Tread: a smooth racing slick at 0, then staggered off-road blocks rising | `DRIVE` or `CLIP`, whichever is higher |
 | A flat: the bottom squashes onto the road and the sidewall bulges; below 0 the tyre is blown up, taller and ballooning | `SAG` |
 | Rim, from a plain dish to laced lowrider wire spokes, then a whitewall with an orange pinstripe, then a gold knock-off spinner | `SUB` |
-| Spin, and the road's dashed centre line scrolling under it | the pitch, while a note sounds |
+| Spin, and the road's dashed yellow centre line scrolling under it | the pitch, while a note sounds |
 | A bounce on every new note, and a rough road: rocks in the tyre's path (it hops over them), cracks in the pavement, and from 40 % weeds in the cracks | `KNOCK` |
 
 ### Good to know
@@ -88,8 +128,8 @@ a curb, a sidewalk and grass behind it, all scrolling past. Each part follows a 
   synths, and a square-ish bass through it overshoots by up to 6 dB; at full scale every note clipped (at -4 dB a hard-driven note can still touch it). Drive and clip
   add density, not peak level. Turning the sub up trades some density for
   weight: about 2 dB less loudness at full.
-- **Saving:** every value above, and the play mode, is saved with the sound. Whether Shift + blue is on drive or
-  clip is not.
+- **Saving:** every value above, and the play mode, is saved with the sound. Which page blue is on, and whether
+  green and white are swapped to the sample, is not.
 - **Tail:** once a note is dying away and has fallen below about −51 dBFS, it fades to silence over about 70 ms
   instead of trailing off through the last few bits of the 16-bit output, which turns to grit when an effect after
   TYR8 brings it up. Held notes at their sustain level are left alone.
@@ -99,7 +139,8 @@ a curb, a sidewalk and grass behind it, all scrolling past. Each part follows a 
 
 ## Signal path
 
-Oscillator (with feedback from the output) → amp envelope → drive → tone → clipper → sub blended in → attack fade.
+Oscillator (with feedback from the output) → amp envelope → drive → tone → + sample layer (SMP HPF, its own drive,
+S.TONE, then SMP ATK's fade-in; above 75 % SAMPLE the note before it fades out) → clipper → sub blended in → attack fade.
 
 ## Build from source
 

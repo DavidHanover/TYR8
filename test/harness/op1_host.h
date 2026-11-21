@@ -1,5 +1,7 @@
 /* PC stand-ins for the firmware addresses and calls op1_plugin.h uses (included by it under -DOP1_HOST).
- * The audio side is plain arrays; the screen side records what the plugin draws, for tyr8_test.c to check and dump. */
+ * The audio side is plain arrays; the screen side records what the plugin draws, for tyr8_test.c to check and dump.
+ * The sampler's per-slot buffers are fakes laid out as R246's SampleBuffer: +0 data pointer (8 guard samples first; on the PC in host_sb_data),
+ * +4 the peaks (one a 256 samples), +0x1038 the capacity. */
 #ifndef OP1_HOST_H
 #define OP1_HOST_H
 #include <stdint.h>
@@ -36,4 +38,11 @@ static inline int op1_current_slot(void) { return host_slot; }
 static inline const int16_t *op1_synth_knobs(int slot) { return host_knobs[slot & 7]; }
 static inline void op1_synth_knobs_live(int slot, int16_t out[4])
 { for (int i = 0; i < 4; i++) out[i] = host_knobs[slot & 7][i]; }
+
+extern const uint8_t *host_sb[8];             /* 0: no buffer for that slot */
+extern int16_t *host_sb_data[8];              /* the data pointer (R246 keeps it at +0, 4 bytes; a PC pointer is 8) */
+static inline const uint8_t *op1_sample_buffer(int slot) { return host_sb[slot & 7]; }
+static inline const int16_t *op1_sample_data(const uint8_t *sb)
+{ for (int i = 0; i < 8; i++) if (host_sb[i] == sb) return host_sb_data[i] + 8; return 0; }
+static inline const int16_t *op1_sample_peaks(const uint8_t *sb) { return (const int16_t *)(sb + 4); }
 #endif

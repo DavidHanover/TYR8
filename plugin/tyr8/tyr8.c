@@ -1,18 +1,27 @@
 /* TYR8: an 808 bass for the OP-1 (hundekraft kennel plugin, tyr8.knl).
  *
  *   T1     turn (words 0..3, the OP-1's own)   Shift + turn (taken by ty_input)
- *   blue   shape, see render                  drive, up to 30 dB (word 5) or clip, soft .. hard (word 6):
- *                                               Shift + blue push switches which one
+ *   blue   two pages, a blue push (with or without Shift) switching them:
+ *            SHAPE page   shape, see render (word 0)           clip, soft .. hard (word 6)
+ *            DRIVE page   drive, up to 30 dB (word 5)          SMP TUNE: the sample's tune (record [9])
  *   green  pitch envelope amount (knock)       knock length, 20 ms .. 1.5 s                     (word 7)
  *   white  tone: low-pass after the drive      sub: a clean sine an octave down (at the note's own   (record)
  *                                               pitch where that would be under ~40 Hz), up to all of it
  *   orange sag, -100 .. 100 %: the pitch falls (up)    glide time, 0 .. 500 ms (record)
  *          or rises (down) while the note lasts; the turn is taken here (ty_input): the fall is word 3, the rise the
  *          record's [7], so a sound saved before 0.9.13 keeps its fall
- *   an orange push, with or without Shift, steps the play mode (record)
+ *   orange pushes on T1 do nothing; the play mode is a T2 orange push, shown under RELEASE (record)
+ *   a white push swaps white over to the sample's own tone (S.TONE, record [12]) and, with Shift, its high-pass
+ *          (SMP HPF, record [14]); not saved
+ *   a green push swaps green over to the sample layer (not saved): turn its level, Shift + turn its attack fade
+ *          (SMP ATK, record [13]); it plays the way the sampler does (record [8]). SMP TUNE, -24 .. +24 semitones on
+ *          top of the sampler's own, following the key, is Shift + blue on blue's DRIVE page. Every push swaps with or
+ *          without Shift
  *
  *   T2     the OP-1's own envelope words (t2_page), drawn by the engine's T2 page:
- *          blue attack 0 .. 1 s, green decay 0.1 .. 4 s, white sustain, orange release 10 ms .. 4 s, its top 5 % HOLD
+ *          blue attack 0 .. 1 s, green decay 0.1 .. 4 s, white sustain, orange release 10 ms .. 4 s, its top 5 % HOLD;
+ *          a green push steps the sample's source: AUTO (the first other slot with a sampler recording), slot 1 .. 8;
+ *          an orange push steps the play mode, shown under RELEASE
  *
  * The engine sounds two octaves below the key played (OCT_DOWN), so the OP-1's octave 0 is already bass.
  * Signal: oscillator (with feedback from the output) -> amp envelope -> drive (two saturating stages, see render) ->
@@ -77,17 +86,34 @@ static uint32_t rv_seen;                      /* the renderer's beat at the owne
 static uint8_t  rv_stale;                     /* owner renders in a row with no render of rv between: rv is gone */
 
 /* ---- the engine's record, saved with the sound: values the eight words have no room for. 0 is each one's default ----
- *   [0] play mode (the orange push steps it)
+ *   [0] play mode (a T2 orange push steps it)
  *   [5] sub: the clean sine's share, 0 .. 32767 (Shift + white)
  *   [6] glide time, 0 .. 32767 (Shift + orange)
  *   [7] sag's rise: how far the pitch rises while the note lasts, 0 .. 32767 (orange turned below 0; the fall is word 3)
+ *   [8] the sample layer's level, 0 (off) .. 32767 (green, swapped)
+ *   [9] its tune on top of the sampler's own: 25 + semitones (1 .. 49), 0 for none (Shift + blue, DRIVE page); rec_get
+ *       gives the semitones, -24 .. 24
+ *   [10] its source: 0 AUTO, 1 .. 8 slot 1 .. 8 (a T2 green push)
+ *   [11] not used (0.9.27 .. 0.9.33: a flip of the sampler's direction, Shift + green push; it plays the sampler's way)
+ *   [12] its own tone, how far closed: 0 open .. 32767 (white, swapped; shown as S.TONE 100 .. 0 %)
+ *   [13] its attack fade, 0 (none) .. 32767 (100 ms) (Shift + green, swapped: SMP ATK)
+ *   [14] its high-pass before its drive, 0 (off) .. 32767: 30 Hz .. 3 kHz (Shift + white, swapped)
+ * The sample layer runs through its own copy of the drive (the same settings, its own states), then its own tone
+ * (S.TONE), and joins the note after the note's tone, before the clipper: TONE does not darken it.
  * [1] .. [4] held the push pages' values up to 0.9.3 and are not read. */
 enum { MODE_GLIDE, MODE_RETRIG, MODE_N };
-enum { REC_MODE = 0, REC_SUB = 5, REC_GLIDE = 6, REC_RISE = 7, REC_N };
+enum { REC_MODE = 0, REC_SUB = 5, REC_GLIDE = 6, REC_RISE = 7, REC_SLVL = 8, REC_STUNE = 9, REC_SRC = 10, REC_SFLIP = 11, REC_STONE = 12, REC_SATK = 13, REC_SHP = 14, REC_N };
+#define SRC_AUTO 0
 #define TY_NAME "tyr8"
 static uint32_t rec_key;                      /* the record's owner key, worked out once */
-static volatile uint8_t blue_clip;            /* Shift + blue turns clip (1) or drive (0); Shift + blue push switches.
+static volatile uint8_t blue_pg;              /* blue's page: 0 SHAPE (Shift: CLIP), 1 DRIVE (Shift: SMP TUNE); a push switches.
                                                * The screen's state, not saved */
+static volatile uint8_t white_smp;            /* a white push swaps white to S.TONE / SMP HPF (1) or TONE / SUB: not saved */
+static volatile uint8_t green_smp;            /* a green push swaps green to the sample layer (1) or knock (0): not saved */
+#ifndef TYRE_BADGE_ON
+#define TYRE_BADGE_ON 0
+#endif
+static volatile uint8_t tyre_badge = TYRE_BADGE_ON;   /* Shift + orange push on T1: the tyre's sidewall markings, an easter egg (not saved) */
 static void rec_get(int slot, int16_t out[REC_N])
 {
     if (!rec_key) rec_key = op1_engine_rec_owner(TY_NAME);
@@ -95,8 +121,112 @@ static void rec_get(int slot, int16_t out[REC_N])
     out[REC_MODE] = r && r[0] > 0 && r[0] < MODE_N ? r[0] : MODE_GLIDE;
     for (int i = 1; i < REC_N; i++) out[i] = !r || r[i] < 0 ? 0 : r[i];
     if (!r) out[REC_GLIDE] = 16384;           /* a new sound (no record yet): glide in the middle, 250 ms */
+    out[REC_STUNE] = out[REC_STUNE] >= 1 && out[REC_STUNE] <= 49 ? out[REC_STUNE] - 25 : 0;   /* semitones */
+    out[REC_SFLIP] = 0;                       /* 0.9.27 .. 0.9.33 kept a flip of the sampler's direction here: not read */
+    if (out[REC_SRC] > 8) out[REC_SRC] = SRC_AUTO;
+}
+/* back to what the record holds */
+static void rec_put(int slot, int16_t r[REC_N])
+{
+    int16_t w[REC_N];
+    for (int i = 0; i < REC_N; i++) w[i] = r[i];
+    w[REC_STUNE] = r[REC_STUNE] ? (int16_t)(r[REC_STUNE] + 25) : 0;
+    op1_engine_record_store(slot, TY_NAME, w, REC_N);
 }
 static int mode_of(int slot) { int16_t r[REC_N]; rec_get(slot, r); return r[REC_MODE]; }
+
+/* ---- the sample layer's source: another slot's sampler recording, found as UZ-1 finds its sample ---- */
+#define SCAN_THR  256                         /* -42 dBFS: where the recording starts and ends */
+#define RESCAN    64                          /* render calls between scans at note-on (about 90 ms) */
+/* the recording's part to play and how the sampler plays it: its rate (the read step a key gives: step, Q12 samples a
+ * voice sample, = key's phase increment x rate >> 38, as R246's sampler voice: sampler+'s sp_voice.c), its gain (Q15)
+ * and its direction */
+typedef struct { const int16_t *d; int32_t on, end, rate, gain; int8_t slot; uint8_t ok, rev; } src_t;
+/* the sampler's gain, as its voice (sampler+'s sp_tap, bit-exact): g = w7^2 x 2 >> 16, and the sample comes out x g x 2
+ * x 16 >> 16, saturated at full scale: x g / 2048, so a quarter of the knob (8192) is 0 dB, the top +24 dB, hard-clipped.
+ * Kept as that factor, Q11 */
+#define SMP_UNITY 2048
+#define RATE_C4 44187388                      /* a recording based at middle C (261.6 Hz): 88200 / (f 16384), Q31 */
+static src_t srcb[2];                         /* double buffered: the key thread fills one, render reads the other */
+static volatile uint8_t src_i, src_force = 1;
+static volatile uint32_t src_at;
+static int sb_open(int slot, const int16_t **d, const int16_t **pk, int32_t *cap)
+{
+    const uint8_t *sb = op1_sample_buffer(slot);
+    if (!sb) return 0;
+#ifndef OP1_HOST
+    if ((uintptr_t)sb >= 0x04000000u || ((uintptr_t)sb & 3)) return 0;
+    const uintptr_t dp = *(const uintptr_t *)sb;
+    if (!dp || dp >= 0x04000000u || (dp & 1)) return 0;
+#endif
+    int32_t c = *(const int32_t *)(sb + 0x1038) - OP1_SAMPLE_GUARD;
+    if (c > OP1_SAMPLE_MAX) c = OP1_SAMPLE_MAX;
+    if (c < 512) return 0;
+    *d = op1_sample_data(sb);
+    *pk = op1_sample_peaks(sb);
+    *cap = c;
+    return 1;
+}
+/* the slot's engine is the synth sampler (R246's engine 6; the table kennel's kn_sampler.c reads) */
+/* and its rate: the slot's sampler object (0x01DF6F78[slot], op1_sample_buffer's) +4, set from the sound's base
+ * frequency (sampler_set_base_freq, kennel's kn_sampler.c) */
+#ifndef OP1_HOST
+static inline int slot_is_sampler(int s) { return *(volatile int *)(0xFF8016E4 + (s & 7) * 4) == 6; }
+static inline int32_t slot_rate(int s) { const int32_t *o = ((const int32_t *const *)0x01DF6F78)[s & 7]; return o ? o[1] : 0; }
+#else
+static int host_sampler_type[8];
+static int32_t host_sampler_rate[8];
+static inline int slot_is_sampler(int s) { return host_sampler_type[s & 7] == 6; }
+static inline int32_t slot_rate(int s) { return host_sampler_rate[s & 7]; }
+#endif
+#define SMP_FULL (OP1_SAMPLE_MAX - OP1_SAMPLE_GUARD)      /* the sampler's markers are fractions of this, 32768 = 1 */
+/* where the recording starts and ends: between the sampler's own START and END markers (its knob words 0 and 3, as
+ * the user trimmed it on the sampler's page; the whole buffer for a slot that is not a sampler any more), from the
+ * buffer's peaks (one a 256 samples) the loud part inside them, then its first loud sample */
+static int scan(int slot, src_t *o)
+{
+    const int16_t *d, *pk;
+    int32_t cap;
+    o->ok = 0; o->slot = (int8_t)slot;
+    if (!sb_open(slot, &d, &pk, &cap)) return 0;
+    int32_t m0 = 0, m1 = cap;
+    o->rate = RATE_C4; o->gain = SMP_UNITY; o->rev = 0;      /* not a sampler any more: as recorded, at middle C */
+    if (slot_is_sampler(slot)) {
+        const int16_t *w = op1_synth_knobs(slot);
+        /* the sampler's own settings: its gain (word 7, squared, as its voice), its direction (word 4 bit 14), and
+         * its tune (the rate; something wild is taken as not set) */
+        const int32_t gw = w[7] < 0 ? 0 : w[7], g = (gw * gw * 2 + 0x8000) >> 16;
+        o->gain = g > 32767 ? 32767 : g;                      /* Q11: the voice plays it x g / 2048, up to 16x (+24 dB) */
+        o->rev = w[4] >= 0x4000;
+        const int32_t rt = slot_rate(slot);
+        if (rt > RATE_C4 / 64 && rt < RATE_C4 * 32) o->rate = rt;
+        const int32_t a = w[0] < 0 ? 0 : w[0], b = w[3] < 0 ? 0 : w[3];
+        const int32_t s0 = (int32_t)(((int64_t)a * SMP_FULL) >> 15), s1 = (int32_t)(((int64_t)b * SMP_FULL) >> 15);
+        if (s1 > s0) { m0 = s0; m1 = s1 < cap ? s1 : cap; }
+    }
+    const int nb = cap / 256 < OP1_PEAK_BUCKETS ? cap / 256 : OP1_PEAK_BUCKETS;
+    int i0 = -1, i1 = -1;
+    for (int i = m0 / 256; i < nb && i * 256 < m1; i++) {
+        const int p = pk[i] < 0 ? -pk[i] : pk[i];
+        if (p >= SCAN_THR) { if (i0 < 0) i0 = i; i1 = i; }
+    }
+    if (i0 < 0) return 0;
+    int32_t on = i0 * 256 > m0 ? i0 * 256 : m0, e = (i1 + 1) * 256;
+    if (e > m1) e = m1;
+    for (int32_t i = on; i < on + 256 && i < e; i++) { const int a = d[i] < 0 ? -d[i] : d[i]; if (a >= SCAN_THR / 2) { on = i; break; } }
+    on = on - 16 > m0 ? on - 16 : m0;                         /* a little before the transient, not before START */
+    if (e > cap - 2) e = cap - 2;
+    if (e - on < 64) return 0;
+    o->d = d; o->on = on; o->end = e; o->ok = 1;
+    return 1;
+}
+/* setting: SRC_AUTO, the first other slot with a recording, or 1 .. 8 */
+static void find_source(int own, int setting, src_t *o)
+{
+    if (setting != SRC_AUTO) { const int s = setting - 1; if (s == own || !scan(s, o)) { o->ok = 0; o->slot = (int8_t)s; } return; }
+    for (int s = 0; s < 8; s++) if (s != own && scan(s, o)) return;
+    o->ok = 0; o->slot = -1;
+}
 
 /* ---- the T2 words (R246's envelope knobs, saved with the sound as its "adsr") as 0 .. 32767 each ----
  * R246 turns attack, decay and release over 64 .. 16320 and sustain over 0 .. 32767. A slot with no words at all (never
@@ -144,6 +274,19 @@ typedef struct {
     uint8_t  ph_h;                            /* the phase's 33rd bit: the octave-down sub's phase is (ph_h ph) / 2 */
     int32_t  ow;                              /* the sub's octave-down share, Q12: 0 at the note's own pitch */
     uint8_t  live;                            /* the envelope has not run out (0 at boot: nothing sounds) */
+    const int16_t *sd;                        /* the sample layer playing: its data (0: none), */
+    int32_t  sp, sst;                         /* where it is and its step a voice sample (< 0: backwards), Q12 samples, */
+    int32_t  srate, stm;                      /* the sampler's rate and SMP TUNE's factor (Q16, x 1/4 .. 4): the step follows the key's pitch every block, */
+    uint32_t sstamp;                          /* while the note that started it is the one sounding */
+    int32_t  sws;                             /* the top of SAMPLE: how far the body is faded out, Q15 (32768 all), smoothed */
+    uint8_t  shad;                            /* this note started a sample: the top of SAMPLE fades the body out */
+    int32_t  sde;                             /* the sample's level, followed (Q18): the sub steps aside while it plays */
+    int32_t  slo, shi;                        /* the part it plays, [slo, shi) */
+    int32_t  sg;                              /* the sampler's gain, Q11 (2048 = 0 dB, up to 16x), clipped at full scale as it does */
+    int32_t  sdc, slp, sz1, sz2;              /* its drive's coupling and lift states (Q18 << 8), its tone's (Q18) */
+    int32_t  sra, sri;                        /* its attack fade, Q15 << 8, and the fade's step a voice sample */
+    int32_t  sfo;                             /* voice samples since the recording ended: its chain rings, then fades */
+    int32_t  sh1, sh2;                        /* its high-pass's two low-pass states, Q15 << 8 */
 } voice_t;
 static voice_t tv[OP1_VOICES];
 
@@ -188,6 +331,25 @@ static int32_t warm(int32_t bk, int32_t g1, int32_t mix, int32_t g)      /* g Q3
     return sum;
 }
 static inline int alive(int v) { return calls - beat[v] < 64; }
+/* a tone knob's filter coefficient (Q11, 2048 open) for how far it is closed, 0 .. 32767: 12 kHz down 6.4 octaves to
+ * 140 Hz, by closed (2 - closed): most of the turn is spent below 2 kHz, where a driven bass changes. Linear in octaves,
+ * the top half of the knob did next to nothing (the clipper after the tone puts its own treble back). Once a block */
+static int32_t tone_tc(int32_t closed)
+{
+    if (closed <= 0) return 2048;
+    const int32_t oct = (int32_t)(((uint32_t)closed * (uint32_t)(65534 - closed)) >> 15);   /* Q15 */
+    const uint32_t wq = (56000u * exp2neg((uint32_t)(oct * 26214) >> 15)) >> 16;           /* 2 pi f / rate, Q16 */
+    const int32_t tc = (int32_t)((wq << 11) / (65536u + wq));
+    return tc < 1 ? 1 : tc;
+}
+/* SMP HPF's coefficient, Q15, for the knob 1 .. 32767: 30 Hz .. 3 kHz, even in octaves (6.64); 0 is off */
+static int32_t hpf_c(int32_t u)
+{
+    if (u <= 0) return 0;
+    const uint32_t wq = (14006u * exp2neg((uint32_t)((32767 - u) * 27197) >> 15)) >> 16;   /* 2 pi f / rate, Q16 */
+    const int32_t c = (int32_t)((wq << 15) / (65536u + wq));
+    return c < 1 ? 1 : c;
+}
 
 static void ty_note_on(void *self, const int16_t *params)
 {
@@ -205,6 +367,16 @@ static void ty_note_on(void *self, const int16_t *params)
     beat[v] = calls;
     stamp[v] = stamp_next++;
     owner = (int8_t)v;
+    /* the sample layer's source, now and then (a scan of the peaks): only with the layer on */
+    const int slot = op1_current_slot();
+    int16_t r[REC_N];
+    rec_get(slot, r);
+    if (r[REC_SLVL] && (src_force || calls - src_at >= RESCAN)) {
+        src_force = 0; src_at = calls;
+        const uint8_t n = src_i ^ 1;
+        find_source(slot, r[REC_SRC], &srcb[n]);
+        src_i = n;
+    }
 }
 
 static void ty_note_off(void *self)
@@ -251,12 +423,18 @@ typedef struct {
     int32_t dm, dg, dgg, da, o, sh_tri, sh_saw, fb, bk, mix, cpl, lift, g2, clip, cg, tc, sub, og;
     int32_t m, g, gg, av;                     /* where the ramps start */
     int32_t ow, dow;                          /* the sub's octave share, Q12 << 7, and its ramp a sample */
+    const int32_t *sb;                        /* the sample layer this block, Q18 after stage 1's gain (zeros: none) */
+    int32_t bw;                               /* the body's share before the clipper, Q11 (2048 all): the top of SAMPLE */
+    const int32_t *dk;                        /* while a sample plays: the sub's share a sample, Q11 (0: bw all block) */
 } blk_t;
 
 static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t *out, const blk_t *k, const int F)
 {
     const int32_t *const inc = k->inc;
     const int16_t *const tab = k->tab;
+    const int32_t *const sb = k->sb;
+    const int32_t bw = k->bw;
+    const int32_t *const dk = k->dk;
     const int32_t dq = k->dq, csh = k->csh;
     const int32_t dm = k->dm, dg = k->dg, dgg = k->dgg, da = k->da, o = k->o, sh_tri = k->sh_tri, sh_saw = k->sh_saw;
     const int32_t fb = k->fb, bk = k->bk, mix = k->mix, cpl = k->cpl, lift = k->lift, g2 = k->g2, clip = k->clip;
@@ -338,6 +516,9 @@ static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t 
             z2 += ((z1 - z2) * tc) >> 11;
             x = z2;
         } else pre = x;
+        x = (x * bw) >> 11;                                    /* the top of SAMPLE fades the body out here, after its drive
+                                                                * and tone, before the clipper (2048: exactly x) */
+        x += sb[n];                                            /* the sample layer, driven and toned on its own */
 
         if (F & F_FB) {                                        /* feedback's tap: here, through a fixed soft clip, so */
             int32_t ft = (x * 7209) >> 12;                     /* that the clip knob does not also set how wild it is */
@@ -350,7 +531,12 @@ static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t 
         const int32_t ys = xc - cube18(xc);
         const int32_t yh = x > Q18_ONE - 8 ? Q18_ONE - 8 : (x < 8 - Q18_ONE ? 8 - Q18_ONE : x);   /* hard: brick wall at +-1 */
         y = ys + (((yh - ys) * clip) >> 12);
-        if (F & F_SUB) y += ((clean - y) * sub) >> 11;         /* sub: after the clipper, so it stays a clean sine */
+        if (F & F_SUB) {                                       /* sub: after the clipper, so it stays a clean sine. It fades
+                                                                * with the body (the top of SAMPLE) and steps aside while a
+                                                                * sample plays, or SUB at full would leave none of it */
+            const int32_t sw = (sub * (dk ? dk[n] : bw)) >> 11;
+            y += ((clean - y) * sw) >> 11;
+        }
         if (F & F_MOD) {
             y = (y * (av >> 10)) >> 12;                        /* attack: a fade of the level, not of the tone */
             av += da;
@@ -377,6 +563,19 @@ static inline __attribute__((always_inline)) void run_block(voice_t *t, int16_t 
     t->last_y = y;
 }
 
+/* the top of SAMPLE: up to SMP_SOLO the sample is laid on the body, through the drive's copy and the clipper; from there
+ * to the end the body (and its sub) fades out between the drive and the clipper, the sample going on through its drive
+ * and the clipper as before: at 100 % the sample alone, driven and clipped */
+#define SMP_SOLO 24576                        /* 75 % */
+static inline int32_t smp_solo(int32_t lv) { return lv <= SMP_SOLO ? 0 : (lv >= 32767 ? 32768 : ((lv - SMP_SOLO) * 32768) / (32767 - SMP_SOLO)); }
+/* the sample layer's step for a phase increment (the key's pitch at the moment, as the OP-1 gives it), Q12 samples a
+ * voice sample: what the sampler would take (inc x rate >> 38), x SMP TUNE's factor; up to 8 samples a voice sample */
+static int32_t smp_step(int32_t inc, int32_t rate, int32_t stm)
+{
+    const int64_t base = ((int64_t)(uint32_t)inc * rate) >> 38;
+    int64_t st = (base * stm) >> 16;
+    return (int32_t)(st < 1 ? 1 : (st > (8 << 12) ? (8 << 12) : st));
+}
 static void ty_render(void *self, int16_t *out, const int16_t *params)
 {
     const int v = op1_voice_index(self);
@@ -454,6 +653,27 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
             t->pe = ONE30;
             t->off = 0;
             t->vel = own_vel;
+            t->sd = 0;                                         /* the sample layer, from its start */
+            t->shad = 0;
+            const src_t *sr = &srcb[src_i];
+            if (rc[REC_SLVL] && sr->ok) {
+                /* the step the sampler would take for this key (key follow: the key's own pitch, not TYR8's two
+                 * octaves down), then SMP TUNE: x 2^(tune / 12) = 4 x 2^-((24 - tune) / 12) */
+                const int32_t tu = rc[REC_STUNE];
+                t->srate = sr->rate;
+                t->stm = (int32_t)(exp2neg((uint32_t)((24 - tu) * 4096) / 12) << 2);
+                const int32_t st = smp_step(own_inc[OP1_BLOCK / 2], t->srate, t->stm);
+                t->sstamp = own_stamp;
+                const int back = sr->rev;                      /* the sampler's own direction */
+                t->sd = sr->d; t->slo = sr->on; t->shi = sr->end; t->sg = sr->gain;
+                t->sp = back ? (sr->end - 1) << 12 : sr->on << 12;
+                t->sdc = t->slp = t->sz1 = t->sz2 = 0; t->sfo = 0; t->sh1 = t->sh2 = 0;
+                const int32_t au = rc[REC_SATK], ams = (((au * au) >> 15) * 100) >> 15;   /* 0 .. 100 ms, a square law */
+                t->sra = ams ? 0 : 32767 << 8;
+                t->sri = ams ? (32767 << 8) / (ams * 88 + 1) : 0;
+                t->sst = back ? -(int32_t)st : (int32_t)st;
+                t->shad = 1; t->sws = smp_solo(rc[REC_SLVL]); t->sde = 0;
+            }
             vis_trig++;
         }
         t->live = 1;
@@ -538,22 +758,93 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     const int32_t lift = (d * 768) >> 15;                      /* Q8, 0 .. 3x */
     const int32_t cpl = d > 4095 ? 4096 : d;                   /* Q12; no coupling at no drive: the clean sub stays whole */
     if (t->restart) t->dcs = warm(bk, g1, mix, g0) * 256;      /* the AC coupling starts where it will settle (Q18 << 8) */
+    /* the sample layer, this block: the recording at the sampler's pitch for the key and SMP TUNE, its way round,
+     * linearly interpolated, faded out over its last 512 samples (no click where it is cut), x the
+     * sampler's gain and clipped as the sampler does, then x SAMPLE (a square law); then the drive's two stages as the note has them (no bias: that
+     * follows the note's envelope), with states of its own, its own tone, S.TONE, and SMP ATK's fade-in. Not through the amp envelope:
+     * it plays whole, whatever the decay. run_block adds it after the note's tone */
+    static const int32_t no_smp[OP1_BLOCK];
+    static int32_t smp[OP1_BLOCK], sdk[OP1_BLOCK];
+    const int32_t *dkb = 0;
+    const int32_t *sbuf = no_smp;
+    /* the top of SAMPLE (smp_solo), ramped a little a block so a turn doesn't step the body's level */
+    const int32_t ws_want = t->shad ? smp_solo(rc[REC_SLVL]) : 0;
+    t->sws += (ws_want - t->sws) >> 2;
+    if ((ws_want - t->sws) >> 2 == 0) t->sws = ws_want;
+    const int32_t ws = t->sws;
+    if (t->sd && rc[REC_SLVL]) {
+        const int32_t lv = rc[REC_SLVL] < SMP_SOLO ? rc[REC_SLVL] : SMP_SOLO;
+        const int32_t lg = (lv * lv) >> 14;                    /* Q15, 1.125 at the top of the layering */
+        const int32_t sgn = t->sg, bwb = (32768 - ws) >> 4;
+        int32_t de = t->sde;
+        const int32_t sg = (lg * g1) >> 15;                    /* Q8, up to 2 x 8 */
+        const int16_t *const sdat = t->sd;
+        int32_t pos = t->sp, sdc = t->sdc, slp = t->slp, z1 = t->sz1, z2 = t->sz2, ra = t->sra, fo = t->sfo;
+        int32_t h1 = t->sh1, h2s = t->sh2;
+        const int32_t hc = hpf_c(rc[REC_SHP]);
+        /* the step follows the key's pitch, block by block, as the sampler's voice does: a new note's pitch can still
+         * be on its way from the last one in its first blocks (portamento, the OP-1's smoothing). Not a legato note's: the
+         * sample of the note before plays on at its pitch */
+        if (own_stamp == t->sstamp) { const int32_t s = smp_step(inc[OP1_BLOCK / 2], t->srate, t->stm); t->sst = t->sst < 0 ? -s : s; }
+        const int32_t st = t->sst, lo = t->slo << 12, hi = t->shi << 12, ri = t->sri;
+        const int32_t stc = tone_tc(rc[REC_STONE]);
+        for (int n = 0; n < OP1_BLOCK; n++) {
+            int32_t x = 0;
+            if (pos >= lo && pos < hi) {
+                const int32_t i = pos >> 12, a = sdat[i], bb = sdat[i + 1];
+                int32_t sv = a + (((bb - a) * (pos & 0xFFF)) >> 12);
+                const int32_t rem = st > 0 ? t->shi - i : i - t->slo + 1;   /* to where it stops */
+                if (rem < 512) sv = (sv * rem) >> 9;
+                sv = (sv * sgn) >> 11;                         /* the sampler's gain, and its clip: what it plays */
+                sv = sv > 32767 ? 32767 : (sv < -32767 ? -32767 : sv);
+                if (hc) {                                      /* SMP HPF: two one-pole high-passes, before the drive */
+                    h1 += (((sv * 256 - h1) >> 8) * hc) >> 7;
+                    const int32_t s1 = sv - (h1 >> 8);
+                    h2s += (((s1 * 256 - h2s) >> 8) * hc) >> 7;
+                    sv = s1 - (h2s >> 8);
+                }
+                x = (sv * sg) >> 5;                            /* Q15 x Q8 -> Q18, stage 1's gain in */
+                pos += st;
+            } else if (fo < 2048) fo++;
+            x = x > Q18_LIM ? Q18_LIM : (x < -Q18_LIM ? -Q18_LIM : x);     /* stage 1 .. stage 2, as run_block */
+            x -= (cube18(x) * mix) >> 12;
+            sdc += (x * 256 - sdc) >> 11;
+            x -= ((sdc >> 8) * cpl) >> 12;
+            slp += (x * 256 - slp) >> 6;
+            x += ((x - (slp >> 8)) * lift) >> 8;
+            x = x > 655360 ? 655360 : (x < -655360 ? -655360 : x);
+            x = (x * g2) >> 8;
+            x = x > Q18_LIM ? Q18_LIM : (x < -Q18_LIM ? -Q18_LIM : x);
+            const int32_t h2 = x > Q18_ONE ? Q18_ONE : (x < -Q18_ONE ? -Q18_ONE : x);
+            x -= cube18(x);
+            x += ((h2 - x) * clip) >> 12;
+            z1 += ((x - z1) * stc) >> 11;                      /* S.TONE (open: exactly x) */
+            z2 += ((z1 - z2) * stc) >> 11;
+            int32_t y = z2;
+            if (ra < (32767 << 8)) {                           /* SMP ATK: after the drive, so the drive can't push the faded
+                                                                * start back up; Q12 steps, no 64-bit product */
+                y = ((y >> 2) * (ra >> 11)) >> 10;
+                ra += ri; if (ra > (32767 << 8)) ra = 32767 << 8;
+            }
+            if (fo > 1024) y = (y * (2048 - fo)) >> 10;        /* after the end: 1024 samples to ring out, 1024 to fade */
+            smp[n] = y;
+            const int32_t ay = y < 0 ? -y : y;                 /* the sample's level, followed: at once up, 5.8 ms down */
+            if (ay > de) de = ay; else de -= de >> 9;
+            const int32_t duck = de >= (Q18_ONE >> 3) ? 2048 : de >> 4;   /* all of the sub out from an eighth of full scale */
+            sdk[n] = (bwb * (2048 - duck)) >> 11;
+        }
+        t->sp = pos; t->sdc = sdc; t->slp = slp; t->sz1 = z1; t->sz2 = z2; t->sra = ra; t->sfo = fo; t->sh1 = h1; t->sh2 = h2s;
+        /* over once the recording has played and its drive and tone have rung out and faded (the coupling's rounding
+         * can hold a few LSBs for ever: they fade with it, no step) */
+        if (fo >= 2048) t->sd = 0;
+        sbuf = smp; t->sde = de; dkb = sdk;
+    } else t->sd = 0;
     const int32_t og = (t->vel * OUT_GAIN) >> 15;
     /* tone, two one-pole low-passes in a row (12 dB / octave) from 12 kHz down to 190 Hz, exactly out of the way when
      * open; sub, a plain sine at the envelope's level faded in under the driven signal (up to three quarters), past
      * the drive and the tone; then the clipper, driven at least 1.76x so that a plain sine with no drive just reaches
      * its ceiling: whatever the settings, the output is at full scale, and a closed tone is a dark wall, not a quiet one */
-    int32_t tc = 2048;                                         /* Q11 */
-    const int32_t closed = 32767 - q15(params[2]);             /* tone: the knob is how open it is */
-    if (closed > 0) {
-        /* 12 kHz down 6.4 octaves to 140 Hz, by closed (2 - closed): most of the turn is spent below 2 kHz, where a
-         * driven bass changes. Linear in octaves, the top half of the knob did next to nothing (the clipper after the
-         * tone puts its own treble back) */
-        const int32_t oct = (int32_t)(((uint32_t)closed * (uint32_t)(65534 - closed)) >> 15);   /* Q15 */
-        const uint32_t wq = (56000u * exp2neg((uint32_t)(oct * 26214) >> 15)) >> 16;   /* 2 pi f / rate, Q16 */
-        tc = (int32_t)((wq << 11) / (65536u + wq));
-        if (tc < 1) tc = 1;
-    }
+    const int32_t tc = tone_tc(32767 - q15(params[2]));        /* Q11; tone: the knob is how open it is */
     int32_t ow0;
 #ifndef SUB_MAX
 #define SUB_MAX 2048                          /* all of it at full: only the clean sine (0.9.7 .. 0.9.13: 60 %) */
@@ -574,7 +865,7 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
 
     /* ---- per sample: the loop built for what this block uses (see run_block) ---- */
     blk_t k;
-    k.inc = inc; k.tab = op1_sin_tab();
+    k.inc = inc; k.tab = op1_sin_tab(); k.sb = sbuf; k.bw = (32768 - ws) >> 4; k.dk = dkb;
     k.dm = dm; k.dg = dg; k.da = da; k.o = t->off; k.dq = dq;
     k.sh_tri = sh_tri; k.sh_saw = sh_saw; k.fb = fb; k.bk = bk; k.mix = mix; k.cpl = cpl; k.lift = lift; k.g2 = g2;
     k.clip = clip; k.cg = cg > 4096 ? cg >> 2 : cg; k.csh = cg > 4096 ? 8 : 10;   /* x cg stays in 32 bits */
@@ -604,7 +895,8 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
     }
     const int32_t o = k.o;
     t->last_inc = (inc[OP1_BLOCK - 1] >> OCT_DOWN) + o;
-    if (t->lvl == 0 && (t->tail >> 11) == 0) t->live = 0;
+    if (!t->sd && ((ws >= 32768 && (t->tail >> 11) == 0) || (t->lvl == 0 && (t->tail >> 11) == 0)))
+        t->live = 0;                                           /* (at SAMPLE 100 % the body is silent: done with the sample) */
 
     vis_inc = (uint32_t)t->last_inc;                           /* the screen follows the sound */
     vis_lvl = t->lvl >> 15;
@@ -616,20 +908,78 @@ static void ty_render(void *self, int16_t *out, const int16_t *params)
  * orange steps the play mode, Shift + blue switches drive / clip, the others do nothing. And the plain orange turn,
  * sag, which goes below 0 */
 extern const op1_engine_ext2_t ENGINE_tyr8;
+static int32_t tune_acc;                      /* the sample tune's part detent */
 static int ty_input(int page, int ev, int a, int b)
 {
-    if (page != OP1_ENG_T1 || a < 0 || a > 3) return 0;
+    if (a < 0 || a > 3) return 0;
     const int slot = op1_current_slot();
     int16_t r[REC_N];
-    if (ev == OP1_ENG_PUSH) {
-        if (b && a == 3) {
+    if (page == OP1_ENG_T2) {                                  /* T2: the turns are R246's (the envelope words); */
+        if (ev != OP1_ENG_PUSH || (a != 1 && a != 3)) return 0;   /* a green push steps the sample's source, */
+        if (b && a == 3) {                                     /* an orange push the play mode (shown under RELEASE) */
             rec_get(slot, r);
             r[REC_MODE] = (int16_t)((r[REC_MODE] + 1) % MODE_N);
-            op1_engine_record_store(slot, TY_NAME, r, REC_N);
-        } else if (b && a == 0 && op1_shift_held()) blue_clip ^= 1;
+            rec_put(slot, r);
+        } else if (b) {
+            rec_get(slot, r);
+            int sv = r[REC_SRC] + 1;                           /* AUTO, 1 .. 8 (not this slot), AUTO */
+            if (sv == slot + 1) sv++;
+            if (sv > 8) sv = SRC_AUTO;
+            r[REC_SRC] = (int16_t)sv;
+            rec_put(slot, r);
+            src_force = 1;
+        }
+        return 1;
+    }
+    if (page != OP1_ENG_T1) return 0;
+    if (ev == OP1_ENG_PUSH) {
+        if (b && a == 3 && op1_shift_held()) tyre_badge ^= 1;   /* Shift + orange: the sidewall's markings (an easter egg) */
+        else if (b && a == 0) blue_pg ^= 1;                  /* blue: SHAPE + CLIP <-> DRIVE + SMP TUNE */
+        else if (b && a == 1) { green_smp ^= 1; src_force = 1; }   /* green (with or without Shift): knock <-> the sample layer */
+        else if (b && a == 2) white_smp ^= 1;                  /* white: tone and sub <-> the sample's tone and fade */
         return 1;
     }
     if (ev != OP1_ENG_TURN) return 0;
+    if (a == 0 && blue_pg) {                                   /* blue's DRIVE page: drive, Shift: SMP TUNE */
+        if (op1_shift_held()) {
+            rec_get(slot, r);
+            int32_t v = r[REC_STUNE] + op1_eng_detents(&tune_acc, b);   /* a semitone a detent */
+            v = v < -24 ? -24 : (v > 24 ? 24 : v);
+            if (v != r[REC_STUNE]) { r[REC_STUNE] = (int16_t)v; rec_put(slot, r); }
+        } else {
+            const int32_t was = q15(op1_synth_knobs(slot)[5]);
+            int32_t v = was + b;                               /* a plain turn's rate, as the OP-1 turns a word */
+            v = v < 0 ? 0 : (v > 32767 ? 32767 : v);
+            if (v != was) op1_engine_word_set(&ENGINE_tyr8.ext.voice, 5, v);
+        }
+        return 1;
+    }
+    if (a == 2 && white_smp) {                                 /* white on the sample: S.TONE, Shift: SMP HPF */
+        rec_get(slot, r);
+        const int at = op1_shift_held() ? REC_SHP : REC_STONE;
+        int32_t v = at == REC_SHP ? r[at] + b / 4 : r[at] - b; /* S.TONE as TONE turns: right opens it; SMP HPF at the
+                                                                * Shift rate */
+        v = v < 0 ? 0 : (v > 32767 ? 32767 : v);
+        if (v != r[at]) { r[at] = (int16_t)v; rec_put(slot, r); }
+        return 1;
+    }
+    if (a == 1 && green_smp) {                                 /* green on the sample layer: level, Shift: SMP ATK */
+        rec_get(slot, r);
+        if (op1_shift_held()) {
+            int32_t v = r[REC_SATK] + b;                       /* full speed, 32 detents (a quarter speed took 10 to pass 1 ms) */
+            v = v < 0 ? 0 : (v > 32767 ? 32767 : v);
+            if (v == r[REC_SATK]) return 1;
+            r[REC_SATK] = (int16_t)v;
+        } else {
+            int32_t v = r[REC_SLVL] + b;                       /* as the OP-1 turns a word: 32 detents */
+            v = v < 0 ? 0 : (v > 32767 ? 32767 : v);
+            if (v == r[REC_SLVL]) return 1;
+            if (!r[REC_SLVL]) src_force = 1;                   /* just on: look for the source at the next note */
+            r[REC_SLVL] = (int16_t)v;
+        }
+        rec_put(slot, r);
+        return 1;
+    }
     if (!op1_shift_held()) {
         if (a != 3) return 0;
         /* orange, sag: -100 .. 100 %, a detent 1024 as the OP-1 turns a word. Up from 0 is the fall (word 3), down
@@ -641,12 +991,12 @@ static int ty_input(int page, int ev, int a, int b)
         if (v == was) return 1;
         const int32_t nf = v > 0 ? v : 0, nr = v < 0 ? -v : 0;
         if (nf != fall) op1_engine_word_set(&ENGINE_tyr8.ext.voice, 3, nf);
-        if (nr != r[REC_RISE]) { r[REC_RISE] = (int16_t)nr; op1_engine_record_store(slot, TY_NAME, r, REC_N); }
+        if (nr != r[REC_RISE]) { r[REC_RISE] = (int16_t)nr; rec_put(slot, r); }
         return 1;
     }
     const int st = b / 4;
     if (a < 2) {
-        const int k = a ? 7 : (blue_clip ? 6 : 5);
+        const int k = a ? 7 : 6;                               /* Shift + blue on the SHAPE page: clip */
         const int32_t was = q15(op1_synth_knobs(slot)[k]);
         int32_t v = was + st;
         v = v < 0 ? 0 : (v > 32767 ? 32767 : v);
@@ -656,7 +1006,7 @@ static int ty_input(int page, int ev, int a, int b)
         const int at = a == 2 ? REC_SUB : REC_GLIDE;
         int32_t v = r[at] + st;
         v = v < 0 ? 0 : (v > 32767 ? 32767 : v);
-        if (v != r[at]) { r[at] = (int16_t)v; op1_engine_record_store(slot, TY_NAME, r, REC_N); }
+        if (v != r[at]) { r[at] = (int16_t)v; rec_put(slot, r); }
     }
     return 1;
 }
@@ -701,8 +1051,10 @@ const op1_engine_ext2_t ENGINE_tyr8 = {
  *   labels   one block a corner, each encoder in its colour (blue and green on top, white and orange below): name,
  *            value and a gauge; while Shift is held the Shift set, blue's drive or clip as switched. The play mode is
  *            under orange's block */
-#define LBL_W     94                          /* width of a corner's label block, px: "KNOCK LEN 1.5S" and a gap */
+#define LBL_W     94                          /* width of a corner's label block, px: "KNCKLEN 999MS" and a gap */
 #define LBL_S     1229                        /* label text scale, Q10: 1.2, 7.2 px a character */
+#define LBL_YB_T1 130                         /* the lower blocks' text, T1: in the corners, 8 px off the bottom as the top's */
+#define LBL_YB_T2 106                         /* and T2: up a line, for the play mode under orange's block */
 #define TRV_X     916                         /* the projection, Q10 */
 #define TRV_Y     (-458)
 #define BCK_X     (-686)
@@ -1010,9 +1362,9 @@ static inline op1_pt gp(int32_t s, int32_t p)
 
 /* ---- road lines: clipped to the screen and cut around the four label blocks, so the road can run the whole
  * diagonal and fill the space between them ---- */
-static const int16_t KEEP_OUT[4][4] = {        /* x0, y0, x1, y1 px: the label blocks (orange's has the mode), and 3 px more
-                                                * toward the scene, so that no moving stroke reaches the still label layer */
-    { 0, 0, 108, 24 }, { 214, 0, 320, 24 }, { 0, 101, 108, 123 }, { 214, 101, 320, 136 } };
+static const int16_t KEEP_OUT[4][4] = {        /* x0, y0, x1, y1 px: the label blocks, and 3 px more toward the scene, so
+                                                * that no moving stroke reaches the still label layer */
+    { 0, 0, 108, 24 }, { 214, 0, 320, 24 }, { 0, 125, 108, 147 }, { 214, 125, 320, 147 } };
 #define ROAD_SEG_MAX 1024
 static op1_pt road_seg[ROAD_SEG_MAX][2];      /* for the tests: the road's pieces as last drawn */
 static int    road_nseg;
@@ -1102,6 +1454,7 @@ static void road_line(void *r, op1_pt a, op1_pt b, const uint8_t *c)
 static inline uint32_t hsh(uint32_t i, uint32_t salt) { i = (i ^ salt) * 2654435761u; i ^= i >> 15; return i * 2246822519u; }
 static inline op1_pt gph(int32_t s, int32_t p, int32_t h) { op1_pt o = gp(s, p); o.y -= h; return o; }
 static const uint8_t COL_KERB[4]  = { 0xA0, 0xA2, 0xA6, 0xFF };
+static const uint8_t COL_LINE[4]  = { 0xD8, 0xB0, 0x28, 0xFF };   /* the centre line: road-paint yellow */
 static const uint8_t COL_GRASS[4] = { 0x3A, 0x9A, 0x4A, 0xFF };
 static const uint8_t COL_WEED[4]  = { 0x8C, 0xE6, 0x4E, 0xFF };
 static int vis_rocks, vis_cracks, vis_weeds, vis_tufts;   /* for the tests */
@@ -1141,7 +1494,29 @@ static void rock(void *r, int32_t s, int32_t p, int32_t rr, int32_t h)
 static void draw_road(void *r, int32_t amt, int32_t shadow_w, int front, int32_t track)
 {
     const int32_t s0 = -OP1_Q10(ROAD_LEN), s1 = OP1_Q10(ROAD_LEN), p0 = OP1_Q10(ROAD_P0), p1 = OP1_Q10(ROAD_P1);
-    if (front) { road_line(r, gp(s0, p0), gp(s1, p0), COL_GREY); return; }   /* the front edge, over the wheel */
+    if (front) {                                               /* the near side, in front of the wheel: its curb's top at the
+                                                                * road's edge (its face looks away), the curb's front, the
+                                                                * sidewalk's front edge and its joints, as the far side's */
+        const int32_t kh = OP1_Q10(KERB_H), pk = p0 - OP1_Q10(4), pw = pk - OP1_Q10(WALK_W);
+        road_line(r, gph(s0, p0, kh), gph(s1, p0, kh), COL_KERB);
+        road_line(r, gph(s0, pk, kh), gph(s1, pk, kh), COL_DIM);
+        road_line(r, gph(s0, pw, kh), gph(s1, pw, kh), COL_GREY);
+        const int32_t slab = OP1_Q10(SLAB_PX), soff = (int32_t)(scroll % (uint32_t)slab);
+        for (int32_t d = s0 - soff; d < s1; d += slab) road_line(r, gph(d, pk, kh), gph(d, pw, kh), COL_DIM);
+        const int32_t cs = OP1_Q10(GRASS_S), cp = OP1_Q10(GRASS_P);      /* and grass beyond it, as the far side's */
+        const uint32_t first = scroll / (uint32_t)cs;
+        const int32_t frac = (int32_t)(scroll % (uint32_t)cs);
+        for (int row = 0; row < GRASS_ROWS; row++)
+            for (int j = -GRASS_COLS; j <= GRASS_COLS; j++) {
+                const uint32_t k = hsh(first + (uint32_t)j, 0x2a77 + (uint32_t)row * 613u);
+                if ((k & 255) > 72) continue;
+                const int32_t s = j * cs - frac + (int32_t)((k >> 8) & 1023) * cs / 1024;
+                const int32_t p = pw - OP1_Q10(3) - row * cp - (int32_t)((k >> 18) & 1023) * cp / 1024;
+                tuft(r, gph(s, p, kh), OP1_Q10(3) + (int32_t)((k >> 28) & 3) * 512, k, COL_GRASS);
+                vis_tufts++;
+            }
+        return;
+    }
     road_nseg = 0;
     vis_rocks = vis_cracks = vis_weeds = vis_tufts = 0;
 
@@ -1160,7 +1535,7 @@ static void draw_road(void *r, int32_t amt, int32_t shadow_w, int front, int32_t
     /* the centre line, dashed, scrolling back as the wheel rolls on */
     const int32_t pm = (p0 + p1) / 2, dash = OP1_Q10(DASH_PX);
     const int32_t off = (int32_t)(scroll % (uint32_t)(2 * dash));
-    for (int32_t d = s0 - off; d < s1; d += 2 * dash) road_line(r, gp(d, pm), gp(d + dash, pm), COL_DIM);
+    for (int32_t d = s0 - off; d < s1; d += 2 * dash) road_line(r, gp(d, pm), gp(d + dash, pm), COL_LINE);
 
     /* grass beyond the sidewalk: a tuft in some cells of a grid, at a jittered place in the cell */
     {
@@ -1260,6 +1635,78 @@ static void wheel_prep(const wheel_t *w, int32_t sp)
     near_face = nf; near_n = nn;
 }
 
+/* the easter egg (Shift + orange push on T1, not saved): the sidewall's markings, as a tyre maker's. With the valve at
+ * 12 o'clock: GRIFTY at 9, TYR8 at 3, a checkered flag at 6. Angular stroke letters (a 5-row grid, 2 or 3 wide, a unit
+ * apart), upright (their tops outward), set through wp so they tilt, squash and turn with the tyre. Where the sidewall
+ * has no room for letters 4 px tall, each marking is a plain white bar */
+typedef struct { char ch; int8_t w, n; int8_t s[11][4]; } glyph_t;
+static const glyph_t GLYPHS[] = {
+    { 'G', 3, 7, { { 3, 4, 1, 4 }, { 1, 4, 0, 3 }, { 0, 3, 0, 1 }, { 0, 1, 1, 0 }, { 1, 0, 3, 0 }, { 3, 0, 3, 2 }, { 3, 2, 2, 2 } } },
+    { 'R', 3, 6, { { 0, 0, 0, 4 }, { 0, 4, 2, 4 }, { 2, 4, 3, 3 }, { 3, 3, 2, 2 }, { 2, 2, 0, 2 }, { 2, 2, 3, 0 } } },
+    { 'I', 2, 3, { { 0, 4, 2, 4 }, { 1, 4, 1, 0 }, { 0, 0, 2, 0 } } },
+    { 'F', 3, 3, { { 0, 0, 0, 4 }, { 0, 4, 3, 4 }, { 0, 2, 2, 2 } } },
+    { 'T', 2, 2, { { 0, 4, 2, 4 }, { 1, 4, 1, 0 } } },
+    { 'Y', 2, 3, { { 0, 4, 1, 2 }, { 2, 4, 1, 2 }, { 1, 2, 1, 0 } } },
+    { '8', 3, 11, { { 1, 0, 2, 0 }, { 2, 0, 3, 1 }, { 3, 1, 2, 2 }, { 2, 2, 3, 3 }, { 3, 3, 2, 4 }, { 2, 4, 1, 4 },
+                    { 1, 4, 0, 3 }, { 0, 3, 1, 2 }, { 1, 2, 0, 1 }, { 0, 1, 1, 0 }, { 1, 2, 2, 2 } } } };
+static const glyph_t *glyph_of(char ch)
+{
+    for (unsigned i = 0; i < sizeof GLYPHS / sizeof GLYPHS[0]; i++) if (GLYPHS[i].ch == ch) return &GLYPHS[i];
+    return &GLYPHS[0];
+}
+/* a bar on the sidewall from arc units x0 to x1 (from ac, clockwise) and radius r0 to r1, filled */
+static void side_bar(const wheel_t *w, int32_t ac, int32_t da, int32_t x0, int32_t x1, int32_t r0, int32_t r1, const uint8_t *c)
+{
+    op1_pt q[8];
+    for (int i = 0; i < 4; i++) {
+        const int32_t x = x0 + (x1 - x0) * i / 3;
+        q[i] = wp(w, ac - x * da, r1, 0);
+        q[7 - i] = wp(w, ac - x * da, r0, 0);
+    }
+    fill_poly(q, 8, c);
+}
+/* a marking centred at angle ac between radii lo and hi: a word, or (word 0) the checkered flag, 20 x 4 units */
+static void side_mark(void *r, const wheel_t *w, int32_t ac, int32_t lo, int32_t hi, const char *word, const uint8_t *c)
+{
+    const int32_t rm = (lo + hi) / 2;
+    int32_t h = (w->rc - w->rrim) * 38 / 100;                  /* the letters' height, Q10 px */
+    if (h > hi - lo) h = hi - lo;
+    int32_t wn = 20;                                           /* the width in units */
+    if (word) { wn = -1; for (const char *k = word; *k; k++) wn += glyph_of(*k)->w + 1; }
+    if (h < OP1_Q10(4)) {                                      /* no room: a white bar, as long as the marking would be */
+        const int32_t hb = h < OP1_Q10(2) ? h : OP1_Q10(2), un = (h > OP1_Q10(2) ? h : OP1_Q10(2)) / 4;
+        if (hb < 512) return;
+        const int32_t da = (int32_t)((int64_t)un * 1304 / rm);
+        side_bar(w, ac, da, -wn / 2, wn - wn / 2, rm - hb / 2, rm + hb / 2, c);
+        return;
+    }
+    const int32_t un = h / 4, da = (int32_t)((int64_t)un * 1304 / rm);   /* a unit, and along the arc in angle */
+    int32_t x = -wn / 2;                                       /* the left edge, in units from the centre */
+    if (!word) {                                               /* the flag: 10 x 2 checks, every other one filled */
+        for (int cy = 0; cy < 2; cy++)
+            for (int cx = 0; cx < 10; cx++)
+                if ((cx + cy) & 1) side_bar(w, ac, da, x + 2 * cx, x + 2 * cx + 2, rm + (cy - 1) * 2 * un, rm + cy * 2 * un, c);
+        for (int q = 0; q < 4; q++) {                          /* its outline, the long sides in four pieces round the arc */
+            const op1_pt a = wp(w, ac - (x + 5 * q) * da, rm - 2 * un, 0), b = wp(w, ac - (x + 5 * q + 5) * da, rm - 2 * un, 0);
+            const op1_pt d = wp(w, ac - (x + 5 * q) * da, rm + 2 * un, 0), e = wp(w, ac - (x + 5 * q + 5) * da, rm + 2 * un, 0);
+            lnp(r, a, b, c); lnp(r, d, e, c);
+        }
+        lnp(r, wp(w, ac - x * da, rm - 2 * un, 0), wp(w, ac - x * da, rm + 2 * un, 0), c);
+        lnp(r, wp(w, ac - (x + 20) * da, rm - 2 * un, 0), wp(w, ac - (x + 20) * da, rm + 2 * un, 0), c);
+        return;
+    }
+    for (const char *k = word; *k; k++) {
+        const glyph_t *g = glyph_of(*k);
+        for (int i = 0; i < g->n; i++) {
+            const int8_t *sg = g->s[i];
+            const op1_pt p0 = wp(w, ac - (x + sg[0]) * da, rm + (2 * sg[1] - 4) * un / 2, 0);
+            const op1_pt p1 = wp(w, ac - (x + sg[2]) * da, rm + (2 * sg[3] - 4) * un / 2, 0);
+            lnp(r, p0, p1, c);
+        }
+        x += g->w + 1;
+    }
+}
+
 static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
 {
     const int32_t a0 = -sp;                                    /* rolling up the road turns it clockwise */
@@ -1299,6 +1746,21 @@ static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
         ring(r, w, r1, 0, COL_WHITE);
         ring(r, w, r1 + OP1_Q10(2), 0, COL_PIN);
     } else ring(r, w, w->rc - span / 4, 0, w->strain ? COL_KNOB[3] : COL_GREY);   /* blown up: the line strains red */
+    if (tyre_badge) {   /* the easter egg's markings, from the valve (a0 + 600) at 12 o'clock: on the plain sidewall between the
+                         * rim and the groove line; on a whitewall, black on the band where it is wide enough, else white
+                         * above its pinstripe */
+        int32_t lo = w->rrim + OP1_Q10(2), hi = w->rc - span / 4 - OP1_Q10(2);
+        const uint8_t *col = COL_WHITE;
+        if (vis_whitewall) {
+            const int32_t ww = (int32_t)(((int64_t)(spokes - 16384) * (span * 6 / 10)) >> 14), b0 = w->rrim + OP1_Q10(1);
+            if (ww >= OP1_Q10(6)) { lo = b0 + OP1_Q10(1); hi = b0 + ww - OP1_Q10(1); col = BLACK; }
+            else { lo = b0 + ww + OP1_Q10(4); hi = w->rc - OP1_Q10(2); }
+        }
+        const int32_t av = a0 + 600;
+        side_mark(r, w, av + 2048, lo, hi, "GRIFTY", col);     /* 9 o'clock */
+        side_mark(r, w, av - 2048, lo, hi, "TYR8", col);       /* 3 o'clock */
+        side_mark(r, w, av + 4096, lo, hi, 0, col);            /* 6 o'clock: the flag */
+    }
 
     /* the rim: rigid, round, turning */
     wheel_t rg = *w;
@@ -1336,23 +1798,24 @@ static void wheel(void *r, const wheel_t *w, int32_t sp, int32_t spokes)
 
 /* one block a corner, each encoder in its colour (blue and green on top, white and orange below): name, value and a
  * gauge of val (0..32767). unit: '%'; 'M' ms (from 1000 shown in seconds); 'S' tenths of a second; 'H' HOLD */
-static void labels(void *r, const char *const name[4], const int32_t val[4], const int32_t num[4], const char unit[4])
+static void labels(void *r, const char *const name[4], const int32_t val[4], const int32_t num[4], const char unit[4], int yb)
 {
     for (int i = 0; i < 4; i++) {
-        const int32_t x0 = OP1_Q10(i & 1 ? 312 - LBL_W : 8), y = OP1_Q10(i < 2 ? 8 : 106);
+        const int32_t x0 = OP1_Q10(i & 1 ? 312 - LBL_W : 8), y = OP1_Q10(i < 2 ? 8 : yb);
         const int32_t len = (OP1_Q10(LBL_W) >> 5) * (val[i] >> 5) >> 5;
         char t[8]; int n = 0;
         int32_t v = num[i];
         char u = unit[i];
         if (u == 'M' && v >= 1000) { v = (v + 50) / 100; u = 'S'; }
         if (v < 0) { t[n++] = '-'; v = -v; }
+        else if (u == 'T' && v > 0) t[n++] = '+';
         if (u == 'H') { t[n++] = 'H'; t[n++] = 'O'; t[n++] = 'L'; t[n++] = 'D'; }
         else if (u == 'S') { t[n++] = (char)('0' + v / 10); t[n++] = '.'; t[n++] = (char)('0' + v % 10); t[n++] = 'S'; }
         else {
             if (v >= 100) t[n++] = (char)('0' + v / 100);
             if (v >= 10) t[n++] = (char)('0' + v / 10 % 10);
             t[n++] = (char)('0' + v % 10);
-            if (u == 'M') { t[n++] = 'M'; t[n++] = 'S'; } else t[n++] = '%';
+            if (u == 'M') { t[n++] = 'M'; t[n++] = 'S'; } else if (u != 'T') t[n++] = '%';   /* T: semitones, bare */
         }
         t[n] = 0;
         sq_text(r, x0, y, LBL_S, name[i], 1024, COL_KNOB[i]);
@@ -1461,10 +1924,9 @@ static void ty_screen_update(void *scr, int dt)
     int32_t val[4], num[4];
     char unit[4];
     if (shift) {
-        static const char *const sn[4] = { "DRIVE", "KNOCK LEN", "SUB", "GLIDE" };
+        static const char *const sn[4] = { "CLIP", "KNCKLEN", "SUB", "GLIDE" };
         for (int i = 0; i < 4; i++) { name[i] = sn[i]; unit[i] = '%'; }
-        if (blue_clip) name[0] = "CLIP";
-        val[0] = blue_clip ? clip : (w[5] < 0 ? 0 : w[5]);
+        val[0] = clip;
         val[1] = w[7] < 0 ? 0 : w[7];
         val[2] = rc[REC_SUB];
         val[3] = rc[REC_GLIDE];
@@ -1473,6 +1935,12 @@ static void ty_screen_update(void *scr, int dt)
         for (int i = 0; i < 3; i++) if (i != 1) num[i] = (val[i] * 100 + 16384) >> 15;
         num[3] = (val[3] * 500 + 16384) >> 15;                               /* glide, ms */
         unit[3] = 'M';
+        if (blue_pg) { name[0] = "SMP TUNE"; num[0] = rc[REC_STUNE]; val[0] = (rc[REC_STUNE] + 24) * 32767 / 48; unit[0] = 'T'; }
+        if (green_smp) {
+            const int32_t au = rc[REC_SATK];
+            name[1] = "SMP ATK"; val[1] = au; num[1] = (((au * au) >> 15) * 100) >> 15; unit[1] = 'M';
+        }
+        if (white_smp) { name[2] = "SMP HPF"; val[2] = rc[REC_SHP]; num[2] = (val[2] * 100 + 16384) >> 15; unit[2] = '%'; }
     } else {
         static const char *const pn[4] = { "SHAPE", "KNOCK", "TONE", "SAG" };
         for (int i = 0; i < 4; i++) { name[i] = pn[i]; val[i] = k[i]; unit[i] = '%'; }
@@ -1482,17 +1950,21 @@ static void ty_screen_update(void *scr, int dt)
         if (!q15(k[3]) && rc[REC_RISE]) val[3] = rc[REC_RISE];              /* sag: the gauge shows how much, */
         num[3] = (val[3] * 100 + 16384) >> 15;                               /* the value, %, its way: */
         if (!q15(k[3]) && rc[REC_RISE]) num[3] = -num[3];                    /* below 0 it rises */
+        if (white_smp) { name[2] = "S.TONE"; val[2] = 32767 - rc[REC_STONE]; num[2] = (val[2] * 100 + 16384) >> 15; }
+        if (blue_pg) { name[0] = "DRIVE"; val[0] = drive; num[0] = (drive * 100 + 16384) >> 15; }
+        if (green_smp) {                                                     /* SMP REV: it plays backwards */
+            const src_t *sr = &srcb[src_i];
+            name[1] = sr->ok && sr->rev ? "SMP REV" : "SAMPLE";
+            val[1] = rc[REC_SLVL]; num[1] = (val[1] * 100 + 16384) >> 15;
+        }
     }
-    static const char *const modes[MODE_N] = { "MONO GLIDE", "MONO RETRIG" };
-    const char *const mt = modes[mode_of(slot)];
-
     /* The labels are a still layer: the core keeps it and each frame restores only the moving areas (the whole screen
      * outside the label blocks, which the street and the tyre never enter), so they are drawn again only when what
      * they say changes. Without the core's region support op1_screen_static is always 1 and everything is drawn */
-    /* the still label areas are the label text and gauges and 1 px: 0..105 x 0..21 and 104..120 on the left, 217..319 x
-     * 0..21 and 104..133 (with the mode) on the right; the moving area is the rest. KEEP_OUT is 3 px bigger */
-    static const op1_rect_t DYN[5] = { { 106, 0, 216, 159 }, { 0, 22, 105, 103 }, { 0, 121, 105, 159 },
-                                       { 217, 22, 319, 103 }, { 217, 134, 319, 159 } };
+    /* the still label areas are the label text and gauges and 1 px: 0..105 and 217..319, x 0..21 at the top and
+     * 128..144 at the bottom (LBL_YB_T1 - 2 .. + 14); the moving area is the rest. KEEP_OUT is 3 px bigger */
+    static const op1_rect_t DYN[5] = { { 106, 0, 216, 159 }, { 0, 22, 105, 127 }, { 0, 145, 105, 159 },
+                                       { 217, 22, 319, 127 }, { 217, 145, 319, 159 } };
     uint32_t lh = 2166136261u;
     for (int i = 0; i < 4; i++) {
         lh = (lh ^ (uint32_t)(uintptr_t)name[i]) * 16777619u;
@@ -1500,16 +1972,13 @@ static void ty_screen_update(void *scr, int dt)
         lh = (lh ^ (uint32_t)(val[i] >> 5)) * 16777619u;     /* the gauge moves in steps of 32 */
         lh = (lh ^ (uint32_t)unit[i]) * 16777619u;
     }
-    lh = (lh ^ (uint32_t)(uintptr_t)mt) * 16777619u;
     static uint32_t last_lh;
     if (lh != last_lh) { last_lh = lh; op1_screen_static_dirty(scr); }
     op1_screen_regions(scr, DYN, 5);
     void *r = op1_raster();
     if (op1_screen_static(scr)) {
         op1_screen_draw(scr, dt);
-        labels(r, name, val, num, unit);
-        /* the play mode, under orange's block and in its colour: its push steps it */
-        sq_text(r, OP1_Q10(312) - sq_width(LBL_S, mt) + OP1_Q10(2), OP1_Q10(123), LBL_S, mt, 1024, COL_KNOB[3]);
+        labels(r, name, val, num, unit, LBL_YB_T1);
         op1_screen_static_done(scr);
     }
 
@@ -1581,7 +2050,33 @@ static void ty_t2_update(void *scr, int dt)
     num[2] = (u[T2_SUSTAIN] * 100 + 16384) >> 15;
     if (hold) unit[3] = 'H', num[3] = 0;
     else num[3] = (int32_t)((4000u * exp2neg((uint32_t)((32767 - rv) * 35407) >> 15) + 32768u) >> 16);   /* ms */
-    labels(r, name, val, num, unit);
+    labels(r, name, val, num, unit, LBL_YB_T2);
+
+    /* the play mode, under orange's block (RELEASE) and in its colour: its push on this page steps it */
+    {
+        static const char *const modes[MODE_N] = { "MONO GLIDE", "MONO RETRIG" };
+        const char *const mt = modes[mode_of(slot)];
+        sq_text(r, OP1_Q10(312) - sq_width(LBL_S, mt) + OP1_Q10(2), OP1_Q10(123), LBL_S, mt, 1024, COL_KNOB[3]);
+    }
+
+    /* the sample layer's source, under green's block (its push steps it): SMP AUTO 2, SMP 3, or NONE where there is no
+     * recording. Looked for again every 300 ms and on a change */
+    int16_t rc[REC_N];
+    rec_get(slot, rc);
+    static src_t look; static int look_t = 1000; static int16_t last_src = -1; static int last_slot = -1;
+    look_t += dt < 0 ? 0 : dt;
+    if (look_t >= 300 || rc[REC_SRC] != last_src || slot != last_slot) {
+        look_t = 0; last_src = rc[REC_SRC]; last_slot = slot;
+        find_source(slot, rc[REC_SRC], &look);
+    }
+    char t[16]; int n = 0;
+    static const char *const pre[2] = { "SMP ", "SMP AUTO " };
+    for (const char *c = pre[rc[REC_SRC] == SRC_AUTO]; *c; c++) t[n++] = *c;
+    if (rc[REC_SRC] != SRC_AUTO) { t[n++] = (char)('0' + rc[REC_SRC]); if (!look.ok) { t[n++] = ' '; t[n++] = '-'; } }
+    else if (look.ok) t[n++] = (char)('1' + look.slot);
+    else t[n++] = '-';
+    t[n] = 0;
+    sq_text(r, OP1_Q10(312) - sq_width(LBL_S, t) + OP1_Q10(2), OP1_Q10(24), LBL_S, t, 1024, look.ok ? COL_KNOB[1] : COL_GREY);
 }
 
 const op1_screen_t SCREEN_tyr8_t2 = { ty_t2_init, ty_t2_update };

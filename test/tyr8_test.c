@@ -11,6 +11,45 @@
 
 int16_t host_sine[8192]; int32_t host_pitch_inc[128]; uint8_t host_voice_mem[6 * 0x24]; int16_t host_voice_vel[6];
 int16_t host_voice_env[128]; int16_t host_knobs[8][8]; int16_t host_t2[8][8]; int host_slot;
+const uint8_t *host_sb[8]; int16_t *host_sb_data[8];
+
+/* ---- the fake sampler buffers (as in UZ-1's test): slot s's recording ---- */
+#define CAP 88200                                 /* 2 s at 44.1 kHz */
+static uint32_t sbmem[8][0x1040 / 4];
+static int16_t smpb[8][8 + CAP];
+static void sb_make(int s)
+{
+    host_sb_data[s] = smpb[s];
+    *(int32_t *)((uint8_t *)sbmem[s] + 0x1038) = CAP + 8;
+    host_sb[s] = (const uint8_t *)sbmem[s];
+    int16_t *pk = (int16_t *)((uint8_t *)sbmem[s] + 4);
+    for (int b = 0; b < OP1_PEAK_BUCKETS; b++) {
+        int m = 0;
+        for (int i = b * 256; i < b * 256 + 256 && i < CAP; i++) { const int a = abs(smpb[s][8 + i]); if (a > m) m = a; }
+        pk[b] = (int16_t)m;
+    }
+}
+/* a kick's attack: silence, then a click (noise) decaying over len samples */
+static void make_click(int s, int pre, int len)
+{
+    memset(smpb[s], 0, sizeof smpb[s]);
+    uint32_t r = 777;
+    for (int i = 0; i < len; i++) { r = r * 1664525u + 1013904223u; smpb[s][8 + pre + i] = (int16_t)(((int32_t)(r >> 16) - 32768) * exp(-5.0 * i / len) * 0.9); }
+    sb_make(s);
+}
+static void make_tone(int s, int pre, int len, double hz)
+{
+    memset(smpb[s], 0, sizeof smpb[s]);
+    for (int i = 0; i < len; i++) smpb[s][8 + pre + i] = (int16_t)lrint(20000 * sin(2 * M_PI * hz * i / 44100));
+    sb_make(s);
+}
+static void no_samples(void) { for (int s = 0; s < 8; s++) host_sb[s] = 0; src_force = 1; }
+#define KEY_C4 (261.6256 / 4)                     /* on() takes the sounding pitch, two octaves under the key */
+static void smp_rec(int lvl, int tune, int src)
+{ host_eng_rec[0][REC_SLVL] = (int16_t)lvl; host_eng_rec[0][REC_STUNE] = (int16_t)(tune ? tune + 25 : 0); host_eng_rec[0][REC_SRC] = (int16_t)src;
+  host_eng_rec_owner[0] = op1_engine_rec_owner("tyr8"); src_force = 1; }
+/* energy above ~2 kHz (a first difference) over [a, b) */
+static double treble(size_t a, size_t b);
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } \
@@ -32,6 +71,7 @@ static int active[6]; static double key_hz[6];      /* the key's own frequency, 
 static int16_t *rec; static size_t rec_n, rec_cap; static int raw_peak;
 static unsigned out_voices;        /* which voices put out sound since it was cleared */
 static int multi_blocks;           /* blocks in which more than one voice put out sound */
+static double porta_hz[6]; static int porta_n[6], porta_i[6];   /* the OP-1's pitch sliding in from porta_hz over porta_n blocks */
 static int kill_voice = -1;        /* a voice the OP-1 has killed: not rendered */
 static uint32_t audio_hash = 2166136261u;
 static int rec_get_mode(void);     /* FNV-1a over every sample rendered: a speed-up must leave it as it was */
@@ -81,7 +121,12 @@ static void run_ms(double ms)
         for (int v = 0; v < 6; v++) {
             if (!active[v]) continue;
             if (ENGINE_tyr8.ext.finished(OP1_VOICE(v))) { active[v] = 0; continue; }
-            for (int n = 0; n < 128; n++) host_pitch_inc[n] = (int32_t)(key_hz[v] / 88200.0 * 4294967296.0);
+            for (int n = 0; n < 128; n++) {
+                double f = key_hz[v];
+                if (porta_i[v] < porta_n[v]) f = porta_hz[v] * pow(key_hz[v] / porta_hz[v], (porta_i[v] * 128 + n) / (128.0 * porta_n[v]));
+                host_pitch_inc[n] = (int32_t)(f / 88200.0 * 4294967296.0);
+            }
+            if (porta_i[v] < porta_n[v]) porta_i[v]++;
             if (v == kill_voice) continue;
             ENGINE_tyr8.ext.voice.render(OP1_VOICE(v), o, P);
             int any = 0; for (int n = 0; n < 128; n++) { sum[n] += o[n]; any |= o[n]; }
@@ -106,6 +151,7 @@ static double bus_peak(void)
 }
 static int peak(size_t a, size_t b) { int p = 0; for (size_t i = a; i < b && i < rec_n; i++) if (abs(rec[i]) > p) p = abs(rec[i]); return p; }
 static size_t at(double ms) { return (size_t)(ms * 88.2); }
+static double treble(size_t a, size_t b) { double e = 0; for (size_t i = a + 1; i < b && i < rec_n; i++) e += (double)(rec[i] - rec[i - 1]) * (rec[i] - rec[i - 1]); return e; }
 /* frequency over [a, b) from rising zero crossings */
 static double freq(size_t a, size_t b)
 {
@@ -130,6 +176,7 @@ static double tail_snr(size_t a, size_t b, double f)
     return 10 * log10(yy / (err > 1e-9 ? err : 1e-9));
 }
 /* how much of the signal over [a, b) is a sine at f Hz: 1 = all of it */
+static double rms_of(size_t a, size_t b) { double e = 0; for (size_t i = a; i < b && i < rec_n; i++) e += (double)rec[i] * rec[i]; return b > a ? e / (b - a) : 0; }
 static double sine_part(size_t a, size_t b, double f)
 {
     double re = 0, im = 0, e = 0;
@@ -200,7 +247,7 @@ static void frame(const char *label) { frame_of(&SCREEN_tyr8, label); }
 /* is the point (Q10 px), m px around it, inside the moving area the screen declares (DYN in ty_screen_update) */
 static int in_dyn(double x, double y, double m)
 {
-    static const int R[5][4] = { { 106, 0, 216, 159 }, { 0, 22, 105, 103 }, { 0, 121, 105, 159 }, { 217, 22, 319, 103 }, { 217, 134, 319, 159 } };
+    static const int R[5][4] = { { 106, 0, 216, 159 }, { 0, 22, 105, 127 }, { 0, 145, 105, 159 }, { 217, 22, 319, 127 }, { 217, 145, 319, 159 } };
     for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) {
         const double px = x / 1024 + dx * m, py = y / 1024 + dy * m;
         int in = 0;
@@ -472,12 +519,15 @@ int main(int argc, char **argv)
     CHECK(rec_get_mode() == MODE_GLIDE && peak(0, rec_n) <= 32768 && fabs(freq(at(400), rec_n) - 82.5) < 0.5, "a sound saved in the old POLY plays in mono glide: one voice, the newest key (%.1f Hz)", freq(at(400), rec_n));
     offk(0); offk(1); run_ms(1500);
     mode(MODE_GLIDE); host_slot = 0;
-    CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1) == 1 && host_eng_rec[0][0] == MODE_RETRIG, "orange push: glide -> retrig");
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 0); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1);
-    CHECK(host_eng_rec[0][0] == MODE_GLIDE, "orange push: retrig -> glide (two modes, no poly)");
-    CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1) == 0 && host_eng_rec[0][0] == MODE_GLIDE, "other pages' pushes are left to the OP-1");
-    host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1); host_shift_held = 0;
-    CHECK(host_eng_rec[0][0] == MODE_RETRIG, "orange push with Shift held still steps the play mode");
+    CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1) == 1 && host_eng_rec[0][0] == MODE_RETRIG, "T2 orange push: glide -> retrig");
+    ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 0); ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1);
+    CHECK(host_eng_rec[0][0] == MODE_GLIDE, "T2 orange push: retrig -> glide (two modes, no poly)");
+    ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 0);
+    CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1) == 1 && host_eng_rec[0][0] == MODE_GLIDE, "a T1 orange push no longer changes the mode");
+    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 0);
+    CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 0, 1) == 0 && host_eng_rec[0][0] == MODE_GLIDE, "T2's other pushes are left to the OP-1");
+    host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 1); ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 3, 0); host_shift_held = 0;
+    CHECK(host_eng_rec[0][0] == MODE_RETRIG, "a T2 orange push with Shift held still steps the play mode");
     mode(MODE_GLIDE);
 
     /* 12. attack (T2 blue), tone, sub */
@@ -521,16 +571,21 @@ int main(int argc, char **argv)
       host_eng_rec_owner[0] = ow; }
 
     /* 12b. the input hook: a plain turn is the OP-1's, every Shift + turn is TYR8's */
-    host_slot = 0; host_shift_held = 0; blue_clip = 0; memset(host_eng_rec[0], 0, sizeof host_eng_rec[0]); mode(MODE_GLIDE);
+    host_slot = 0; host_shift_held = 0; blue_pg = 0; memset(host_eng_rec[0], 0, sizeof host_eng_rec[0]); mode(MODE_GLIDE);
     memset(host_knobs, 0, sizeof host_knobs); host_knobs[0][5] = 14000; host_knobs[0][6] = 12000; host_knobs[0][7] = 4500;
     CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 1024) == 0 && ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 2, 1024) == 0, "a plain turn is the OP-1's");
-    CHECK(shift_turn(0, 4 * 1024) == 1 && host_knobs[0][5] == 15024 && host_knobs[0][6] == 12000, "Shift + blue, four detents: drive %d (+1024), clip untouched", host_knobs[0][5]);
-    host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 0); host_shift_held = 0;
-    CHECK(blue_clip == 1 && shift_turn(0, -2 * 1024) == 1 && host_knobs[0][6] == 11488 && host_knobs[0][5] == 15024, "Shift + blue push switches to clip: clip %d, drive kept", host_knobs[0][6]);
-    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 1);
-    CHECK(blue_clip == 1, "a blue push without Shift does not switch");
+    CHECK(shift_turn(0, 4 * 1024) == 1 && host_knobs[0][6] == 13024 && host_knobs[0][5] == 14000, "SHAPE page, Shift + blue, four detents: clip %d (+1024), drive untouched", host_knobs[0][6]);
+    ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 0);
+    host_eng_words[0][5] = host_knobs[0][5];
+    const int took_d = ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 2 * 1024);
+    host_knobs[0][5] = host_eng_words[0][5];
+    CHECK(blue_pg == 1 && took_d && host_knobs[0][5] == 16048 && host_knobs[0][0] == 0, "a blue push: the DRIVE page, a plain turn is drive (two detents: %d), shape untouched", host_knobs[0][5]);
+    shift_turn(0, 3 * 1024);
+    CHECK(host_eng_rec[0][REC_STUNE] == 25 + 3 && host_knobs[0][6] == 13024, "and Shift + blue the sample's tune (+%d semitones), clip untouched", host_eng_rec[0][REC_STUNE] - 25);
+    shift_turn(0, -3 * 1024);
     host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 0, 1); host_shift_held = 0;
-    CHECK(blue_clip == 0, "a second Shift + blue push is back to drive");
+    CHECK(blue_pg == 0 && ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 1024) == 0, "a push with Shift switches too: back on SHAPE, the plain turn the OP-1's");
+    host_eng_rec[0][REC_SHP] = 0;
     shift_turn(1, 300 * 1024);
     CHECK(host_knobs[0][7] == 32767, "Shift + green: knock length, stops at the top (%d)", host_knobs[0][7]);
     shift_turn(2, 10 * 1024); shift_turn(3, 3 * 1024); shift_turn(3, -1024);
@@ -730,6 +785,295 @@ int main(int argc, char **argv)
       offk(0); offk(1); run_ms(500); }
     sub(0);
 
+    /* 21. the sample layer: another slot's recording mixed in at the oscillator's stage on every restarted note */
+    {
+        smp_rec(0, 0, 0); make_click(2, 3000, 1500);             /* a 34 ms click in slot 3, tyr8 on slot 1 */
+        reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(400); offk(0); run_ms(100);
+        const uint32_t h_off = audio_hash; size_t n_off = rec_n; int16_t *ref = malloc(n_off * 2); memcpy(ref, rec, n_off * 2);
+        no_samples(); audio_hash = h_off;
+        reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(400); offk(0); run_ms(100);
+        CHECK(!memcmp(ref, rec, n_off * 2), "SAMPLE at 0: the same samples as with no recording anywhere");
+        make_click(2, 3000, 1500); smp_rec(SMP_SOLO, 0, 0);
+        reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(400); offk(0); run_ms(100);
+        const double h_on = treble(0, at(30)), h_ref = 0;
+        double e0 = 0; for (size_t i = 1; i < at(30); i++) e0 += (double)(ref[i] - ref[i - 1]) * (ref[i] - ref[i - 1]);
+        (void)h_ref;
+        int same = 1; for (size_t i = at(60); i < n_off; i++) if (rec[i] != ref[i]) { same = 0; break; }
+        CHECK(h_on > 50 * e0 && same, "SAMPLE 75 %% (the top of the layering), no drive: a click over the first 30 ms (treble %.0fx the plain note's), the note itself after it untouched", h_on / (e0 > 0 ? e0 : 1));
+        CHECK(raw_peak <= 32767, "and inside full scale");
+        wav("sample_click");
+        { /* the top of SAMPLE: from 75 % the body (and its sub) fades out between the drive and the clipper; at 100 % the
+           * sample alone, still through its drive and the clipper */
+          make_tone(2, 3000, 13230, 3000);
+          for (int i = 0; i < 13230; i++) smpb[2][8 + 3000 + i] = (int16_t)(smpb[2][8 + 3000 + i] * 3 / 5);   /* 12000 peak */
+          sb_make(2);
+          #define RAWPK(a, b) (peak(a, b) * (double)OUT_GAIN / 32767)
+          smp_rec(32767, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(250);
+          const double pk100 = RAWPK(at(20), at(120)), body100 = sine_part(at(20), at(120), KEY_C4);
+          CHECK(pk100 > 8000 && body100 < 0.02, "SAMPLE 100 %%: the sample alone (peak %.0f), no body under it (%.1f %% at the note's pitch)", pk100, body100 * 100);
+          wav("sample_solo");
+          { /* SUB at full is only the clean sine; it steps aside for the sample, and fades with the body at the top of
+             * SAMPLE: SUB 100 % and SAMPLE 100 % play the sample, SUB 100 % and SAMPLE 50 % the sample over the sine */
+            sub(32767);
+            smp_rec(32767, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(150);
+            const double both = sine_part(at(20), at(120), 3000), pk_both = RAWPK(at(20), at(120));
+            #define AMP3K(a, b) (sine_part(a, b, 3000) * sqrt(treble(a, b) * 0 + rms_of(a, b)))
+            smp_rec(16384, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(400);
+            const double half = AMP3K(at(20), at(120)), after = sine_part(at(330), at(390), KEY_C4);
+            sub(0);
+            smp_rec(16384, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(150);
+            const double half0 = AMP3K(at(20), at(120));
+            #undef AMP3K
+            CHECK(both > 0.8 && pk_both > 8000 && half > 0.8 * half0 && after > 0.9,
+                  "SUB 100 %%: with SAMPLE 100 %% the sample plays (%.0f %% of it, peak %.0f); at SAMPLE 50 %% it plays over the sine at %.0f %% of its level with SUB 0, and the sine is back after it (%.0f %%)",
+                  both * 100, pk_both, half / half0 * 100, after * 100); }
+          make_tone(2, 3000, 13230, 200);
+          for (int i = 0; i < 13230; i++) smpb[2][8 + 3000 + i] = (int16_t)(smpb[2][8 + 3000 + i] * 3 / 5);
+          sb_make(2); src_force = 1;
+          smp_rec(32767, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(150);
+          const double tr0 = treble(at(20), at(120)) / (double)(peak(at(20), at(120)) + 1) / (peak(at(20), at(120)) + 1);
+          smp_rec(32767, 0, 0); reset(); set(SINE, 0, 4500, 16000, 32767, 0, 127, 0); on(0, KEY_C4, 127); run_ms(150);
+          const double tr1 = treble(at(20), at(120)) / (double)(peak(at(20), at(120)) + 1) / (peak(at(20), at(120)) + 1);
+          CHECK(tr1 > 3 * tr0, "and DRIVE still shapes it: a 200 Hz sample alone, full drive, has %.1fx the treble of no drive", tr1 / tr0);
+          wav("sample_solo_driven");
+          make_tone(2, 3000, 13230, 3000);
+          for (int i = 0; i < 13230; i++) smpb[2][8 + 3000 + i] = (int16_t)(smpb[2][8 + 3000 + i] * 3 / 5);
+          sb_make(2); src_force = 1;
+          { /* the sampler's gain as the sampler plays it: a quarter of its knob is 0 dB, the top x16 (+24 dB), clipped at
+             * full scale before anything of TYR8's. At SAMPLE 100 %, a tone at 0 dB comes out rounded, at the top squared */
+            host_sampler_type[2] = 6; host_sampler_rate[2] = RATE_C4; host_knobs[2][0] = 0; host_knobs[2][3] = 32767; host_knobs[2][4] = 0;
+            #define FLAT(f) do { const int pk = peak(at(20), at(120)); int nf = 0, nn = 0; \
+                for (size_t i = at(20); i < at(120); i++, nn++) { if (abs(rec[i]) >= pk * 0.97) nf++; } f = nf * 100 / nn; } while (0)
+            int f0, f24;
+            host_knobs[2][7] = 8192; src_force = 1;
+            smp_rec(32767, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(150);
+            FLAT(f0);
+            host_knobs[2][7] = 32767; src_force = 1;
+            smp_rec(32767, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(150);
+            FLAT(f24);
+            #undef FLAT
+            CHECK(f0 < 25 && f24 > 60, "the sampler's gain: at 0 dB the tone stays rounded (%d %% of it at its peak), at +24 dB it is squared off (%d %%)", f0, f24);
+            wav("sample_solo_slammed");
+            host_sampler_type[2] = 0; host_sampler_rate[2] = 0; host_knobs[2][3] = 0; host_knobs[2][7] = 0; src_force = 1; }
+          smp_rec(SMP_SOLO, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(250);
+          const double body75 = sine_part(at(20), at(120), KEY_C4);
+          smp_rec((SMP_SOLO + 32767) / 2, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(250);
+          const double body87 = sine_part(at(20), at(120), KEY_C4), pk87 = RAWPK(at(20), at(120));
+          CHECK(body75 > 0.3 && body87 > 0.05 && body87 < body75 && pk87 > 0.4 * pk100, "between 75 and 100 %% the body fades out (its share %.0f %% at 75, %.0f %% at 87.5) as the sample comes in", body75 * 100, body87 * 100);
+          /* no recording: SAMPLE 100 %% leaves the note as it is, never silence */
+          no_samples(); audio_hash = 0;
+          smp_rec(32767, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(200);
+          const size_t nn = rec_n; int16_t *r1 = malloc(nn * 2); memcpy(r1, rec, nn * 2);
+          smp_rec(0, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(200);
+          CHECK(!memcmp(r1, rec, nn * 2), "with no recording found, SAMPLE 100 %% plays the note as SAMPLE 0 does");
+          free(r1);
+          /* at SAMPLE 100 %, a new note cutting the sample: no click */
+          make_tone(2, 3000, 13230, 3000);
+          for (int i = 0; i < 13230; i++) smpb[2][8 + 3000 + i] = (int16_t)(smpb[2][8 + 3000 + i] * 3 / 5);
+          sb_make(2); src_force = 1;
+          smp_rec(32767, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(50.3);
+          const size_t cut = rec_n; on(0, KEY_C4, 127); run_ms(30);
+          int jump = 0; for (size_t i = cut - 4; i < cut + 400 && i < rec_n; i++) { const int d = abs(rec[i] - rec[i - 1]); if (d > jump) jump = d; }
+          int own = 0; for (size_t i = at(20); i < at(45); i++) { const int d = abs(rec[i] - rec[i - 1]); if (d > own) own = d; }
+          CHECK(jump < own * 1.6, "at SAMPLE 100 %%, a new note cuts the sample without a click (largest step %d, the tone's own %d)", jump, own);
+          offk(0); run_ms(600);
+          CHECK(!active[0] || ENGINE_tyr8.ext.finished(OP1_VOICE(0)), "and the voice is given back once it has played");
+          #undef RAWPK
+          make_click(2, 3000, 1500); smp_rec(SMP_SOLO, 0, 0); }
+        /* through the drive: driven, the click comes out denser than clean */
+        reset(); set(SINE, 0, 4500, 16000, 32767, 0, 127, 0); on(0, KEY_C4, 127); run_ms(400); offk(0); run_ms(100);
+        wav("sample_click_driven");
+        CHECK(peak(0, at(30)) > 20000, "with full drive it goes through the drive and clipper (peak %d over the click)", peak(0, at(30)));
+        /* it plays whole however short the note: a 300 ms recording over a 0.1 s decay */
+        make_tone(2, 3000, 13230, 3000); src_force = 1;
+        reset(); set(SINE, 0, 4500, 0, 0, 0, 0, 0); on(0, KEY_C4, 127);
+        run_ms(5); offk(0); run_ms(600);
+        const double s250 = sine_part(at(200), at(280), 3000);
+        CHECK(s250 > 0.9 && peak(at(200), at(280)) > 2000, "a 300 ms recording plays whole over a 0.1 s decay (at 200 .. 280 ms it is %.0f %% the recording's 3 kHz)", s250 * 100);
+        CHECK(!active[0] && peak(at(320), rec_n) == 0, "and then the voice is given back, silent");
+        /* the sampler's own START and END: trimmed to 50 ms on the sampler's page, the layer is 50 ms; START 100 ms
+         * in, it starts there. A slot that is not a sampler (its words are another engine's) plays the whole buffer */
+        {
+            const double f = 32768.0 / (OP1_SAMPLE_MAX - OP1_SAMPLE_GUARD);
+            host_sampler_type[2] = 6; host_knobs[2][7] = 8192; host_knobs[2][0] = 0; host_knobs[2][3] = (int16_t)lrint((3000 + 2205) * f + 1);
+            reset(); set(SINE, 0, 4500, 0, 0, 0, 0, 0); on(0, KEY_C4, 127); run_ms(5); offk(0); run_ms(400);
+            const double cut = sine_part(at(120), at(200), 3000), early = sine_part(at(10), at(40), 3000);
+            const int ends = active[0] == 0 && peak(at(200), rec_n) == 0;
+            CHECK(early > 0.85 && peak(at(120), at(200)) < 300 && ends, "the sampler trimmed to END 50 ms: the layer stops there (3 kHz %.0f %% at 10 .. 40 ms; peak after %d)", early * 100, peak(at(120), at(200)));
+            host_knobs[2][0] = (int16_t)lrint((3000 + 4410) * f); host_knobs[2][3] = 32767;
+            src_force = 1; reset(); set(SINE, 0, 4500, 0, 0, 0, 0, 0); on(0, KEY_C4, 127); run_ms(5); offk(0); run_ms(400);
+            const double still = sine_part(at(150), at(190), 3000);
+            const int gone = peak(at(215), rec_n) < 300;
+            CHECK(peak(0, at(3)) > 3000 && still > 0.9 && gone, "START 100 ms in: it starts there at once (peak %d in 3 ms), and the 200 ms left play (%.0f %% at 150 .. 190 ms), then nothing (%d)", peak(0, at(3)), still * 100, peak(at(215), rec_n));
+            host_sampler_type[2] = 0; host_knobs[2][0] = 0; host_knobs[2][3] = 3000;
+            src_force = 1; reset(); set(SINE, 0, 4500, 0, 0, 0, 0, 0); on(0, KEY_C4, 127); run_ms(5); offk(0); run_ms(400);
+            CHECK(sine_part(at(200), at(280), 3000) > 0.9, "a slot that is not a sampler: its words are not markers, the whole recording plays");
+            host_knobs[2][3] = 0; src_force = 1; (void)cut;
+        }
+        /* the pitch: the sampler's for the key played (key follow), then SMP TUNE, -24 .. +24 */
+        #define PITCHED(tune, key, hz) (smp_rec(SMP_LVL, tune, 0), reset(), set(SINE, 0, 4500, 16000, 0, 0, 127, 0), on(0, key, 127), run_ms(100), sine_part(at(20), at(100), hz))
+        const int SMP_LVL = 32767;
+        const double at_c4 = PITCHED(0, KEY_C4, 3000), at_c5 = PITCHED(0, KEY_C4 * 2, 6000), at_g3 = PITCHED(0, KEY_C4 * 0.75, 2250);
+        CHECK(at_c4 > 0.5 && at_c5 > 0.5 && at_g3 > 0.5, "key follow: a recording based at middle C plays as recorded on the C4 key (3 kHz %.0f %%), an octave up on C5 (%.0f %%), a fourth down on G3 (%.0f %%)", at_c4 * 100, at_c5 * 100, at_g3 * 100);
+        const double up = PITCHED(24, KEY_C4, 12000), dn = PITCHED(-24, KEY_C4, 750), u7 = PITCHED(7, KEY_C4, 3000 * pow(2, 7 / 12.0));
+        CHECK(up > 0.45 && dn > 0.5 && u7 > 0.5, "SMP TUNE +24: two octaves up, 12 kHz (%.0f %%); -24: 750 Hz (%.0f %%); +7: a fifth (%.0f %%)", up * 100, dn * 100, u7 * 100);
+        /* the sampler's own settings are where it starts: its tune (based at A4 here), its gain, its direction */
+        host_sampler_type[2] = 6; host_sampler_rate[2] = 26273978; host_knobs[2][0] = 0; host_knobs[2][3] = 32767; host_knobs[2][4] = 12000; host_knobs[2][7] = 8192;
+        const double a4 = PITCHED(0, KEY_C4, 3000 * 261.6256 / 440), a4t = PITCHED(12, KEY_C4, 6000 * 261.6256 / 440);
+        CHECK(a4 > 0.5 && a4t > 0.5, "the sampler's tune: based at A4, the C4 key plays it 9 semitones down (%.0f %%), SMP TUNE +12 from there (%.0f %%)", a4 * 100, a4t * 100);
+        /* the pitch still sliding in from a higher note (portamento, the OP-1's smoothing): the sample follows it to the
+         * key's own, as the sampler does, and does not keep the first block's */
+        { porta_hz[0] = KEY_C4 * 4 * (1 << OCT_DOWN); porta_n[0] = 6; porta_i[0] = 0;
+          const double sl = PITCHED(0, KEY_C4, 3000 * 261.6256 / 440);
+          porta_n[0] = 0;
+          CHECK(sl > 0.5 && fabs(sl - a4) < 0.1, "after a note two octaves up, with the pitch sliding in over 9 ms: the sample settles at the key's own pitch (%.0f %%, %.0f %% without the slide)", sl * 100, a4 * 100); }
+        #undef PITCHED
+        make_click(2, 3000, 1500);
+        double e_full, e_q;
+        { /* gain: the sampler's word 7 at half its turn is a quarter (its square), heard over a quiet note */
+          smp_rec(0, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(40);
+          int16_t *base = malloc(rec_n * 2); const size_t bn = rec_n; memcpy(base, rec, bn * 2);
+          double e[2];
+          for (int q = 0; q < 2; q++) {
+              host_knobs[2][7] = q ? 4096 : 8192;
+              smp_rec(8192, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(40);
+              e[q] = 0; for (size_t k = 0; k < bn; k++) e[q] += ((double)rec[k] - base[k]) * ((double)rec[k] - base[k]);
+          }
+          free(base); e_full = e[0]; e_q = e[1];
+          CHECK(fabs(sqrt(e_q / e_full) - 0.25) < 0.03, "the sampler's gain at half: the layer at a quarter (%.3f)", sqrt(e_q / e_full)); }
+        host_knobs[2][7] = 8192;
+        { /* direction: the click forwards is loud then quiet; the sampler set to reverse plays it quiet then loud;
+           * a flip saved by 0.9.27 .. 0.9.33 (record 11) is not read: it plays the sampler's way */
+          double fw[2], rv[2], fl[2];
+          #define HALVES(o) do { smp_rec(32767, 0, 0); host_eng_rec[0][REC_SFLIP] = flip; reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(60); \
+              o[0] = treble(0, at(15)); o[1] = treble(at(15), at(34)); } while (0)
+          int flip = 0;
+          host_knobs[2][4] = 12000; HALVES(fw);
+          host_knobs[2][4] = 20000; HALVES(rv);
+          flip = 1; HALVES(fl);
+          #undef HALVES
+          CHECK(fw[0] > 4 * fw[1] && rv[1] > 4 * rv[0] && fl[1] > 4 * fl[0], "direction: forwards loud first (%.2g, %.2g), the sampler reversed quiet first (%.2g, %.2g), and an old saved flip doesn't turn it round", fw[0], fw[1], rv[0], rv[1]);
+          host_knobs[2][4] = 12000; host_eng_rec[0][REC_SFLIP] = 1;
+          host_eng_rec[0][REC_SFLIP] = 0; }
+        host_sampler_type[2] = 0; host_sampler_rate[2] = 0; host_knobs[2][4] = 0; host_knobs[2][7] = 0; host_knobs[2][3] = 0;
+        make_tone(2, 3000, 13230, 3000);
+        /* legato: no new sample; retrig: one every note */
+        make_click(2, 3000, 1500); smp_rec(SMP_SOLO, 0, 0);
+        reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 50); mode(MODE_GLIDE); on(0, KEY_C4, 127); run_ms(200); size_t l0 = rec_n; on(1, KEY_C4 * 1.5, 127); run_ms(100);
+        const double leg = treble(l0, l0 + at(30));
+        offk(1); offk(0); run_ms(800);
+        reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 50); mode(MODE_RETRIG); on(0, KEY_C4, 127); run_ms(200); size_t r0 = rec_n; on(1, KEY_C4 * 1.5, 127); run_ms(100);
+        const double ret = treble(r0, r0 + at(30));
+        offk(1); offk(0); run_ms(800); mode(MODE_GLIDE);
+        CHECK(ret > 30 * leg, "a glided legato note plays no sample; a restarted one does (treble %.3g vs %.3g)", leg, ret);
+        /* the source: AUTO finds the recording, a set slot without one plays nothing */
+        smp_rec(32767, 0, 5);                                   /* slot 5: empty */
+        reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(100);
+        const double none = treble(0, at(30));
+        smp_rec(32767, 0, 3);                                   /* slot 3: the click */
+        reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(100);
+        CHECK(treble(0, at(30)) > 50 * none, "SMP 5 (empty) plays no sample, SMP 3 does");
+        offk(0); run_ms(800);
+        /* its own tone: the note's TONE closed leaves the click bright; S.TONE closed darkens it. SAMPATT fades it in */
+        {
+            make_click(2, 3000, 1500);
+            #define CLICK(tn, stn, att) (smp_rec(32767, 0, 0), host_eng_rec[0][REC_STONE] = (int16_t)(stn), host_eng_rec[0][REC_SATK] = (int16_t)(att), tone(tn), \
+                                         reset(), set(SINE, 0, 4500, 16000, 0, 0, 127, 0), on(0, KEY_C4, 127), run_ms(60))
+            CLICK(32767, 0, 0); const double open = treble(0, at(30));
+            CLICK(8000, 0, 0); const double tone_closed = treble(0, at(30));
+            CLICK(32767, 26000, 0); const double s_closed = treble(0, at(30));
+            CLICK(32767, 0, 0); const double a0 = treble(0, at(4));
+            CLICK(32767, 0, 32767); const double a100 = treble(0, at(4));
+            CLICK(32767, 0, 0); const double b0 = treble(at(25), at(32));
+            CLICK(32767, 0, 16384); const double a25 = treble(0, at(4)), a25b = treble(at(25), at(32));
+            CHECK(tone_closed > 0.6 * open && s_closed < 0.1 * open, "TONE closed leaves the sample bright (%.0f %% of its treble), S.TONE closed darkens it (%.1f %%)", tone_closed / open * 100, s_closed / open * 100);
+            CHECK(a100 < 0.05 * a0 && a25 < 0.1 * a0 && a25b > 0.5 * b0, "SAMPATT: the click fades in (first 4 ms %.1f %% of its treble at 100 ms, %.1f %% at 25 ms; at 25 ms it is through, %.0f %% after it)", a100 / a0 * 100, a25 / a0 * 100, a25b / b0 * 100);
+            { /* and as much with the drive full: the fade is after the sample's drive, which can't undo it */
+              #define CLKD(att) (smp_rec(SMP_SOLO, 0, 0), host_eng_rec[0][REC_SATK] = (int16_t)(att), reset(), set(SINE, 0, 4500, 16000, 32767, 0, 127, 0), on(0, KEY_C4, 127), run_ms(60))
+              CLKD(0); const double d0 = treble(0, at(4));
+              CLKD(16384); const double d25 = treble(0, at(4));
+              CLKD(32767); const double d100 = treble(0, at(4));
+              CHECK(d100 < 0.05 * d0 && d25 < 0.15 * d0, "SAMPATT at full drive: the click still fades in (first 4 ms %.1f %% at 100 ms, %.1f %% at 25 ms)", d100 / d0 * 100, d25 / d0 * 100);
+              #undef CLKD
+              host_eng_rec[0][REC_SATK] = 0; }
+            wav("sample_stone_closed");
+            /* driven and toned, it still ends: the voice comes back, silent */
+            smp_rec(32767, 0, 0); host_eng_rec[0][REC_STONE] = 16000; tone(32767);
+            reset(); set(SINE, 0, 4500, 0, 32767, 0, 0, 0); on(0, KEY_C4, 127); run_ms(5); offk(0); run_ms(600);
+            CHECK(!active[0] && peak(at(400), rec_n) == 0, "driven, S.TONE half: the layer rings out and the voice is given back");
+            #undef CLICK
+            host_eng_rec[0][REC_STONE] = 0; host_eng_rec[0][REC_SATK] = 0; tone(32767);
+            /* SMP HPF: the sample's low end goes before its drive; its top stays */
+            {
+                double e[2][2];
+                for (int f = 0; f < 2; f++) {
+                    make_tone(2, 3000, 13230, f ? 3000 : 150);
+                    smp_rec(0, 0, 0); reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(150);
+                    int16_t *base = malloc(rec_n * 2); const size_t bn = rec_n; memcpy(base, rec, bn * 2);
+                    for (int h = 0; h < 2; h++) {
+                        smp_rec(8192, 0, 0); host_eng_rec[0][REC_SHP] = (int16_t)(h ? 24576 : 0);
+                        reset(); set(SINE, 0, 4500, 16000, 0, 0, 127, 0); on(0, KEY_C4, 127); run_ms(150);
+                        e[f][h] = 0; for (size_t k = at(50); k < bn; k++) e[f][h] += ((double)rec[k] - base[k]) * ((double)rec[k] - base[k]);
+                    }
+                    free(base);
+                }
+                const double lo = sqrt(e[0][1] / e[0][0]), hi = sqrt(e[1][1] / e[1][0]);
+                CHECK(lo < 0.06 && hi > 0.8, "SMP HPF at 75 %% (~950 Hz): a 150 Hz sample down to %.1f %%, a 3 kHz one kept (%.0f %%)", lo * 100, hi * 100);
+                host_eng_rec[0][REC_SHP] = 0; make_click(2, 3000, 1500);
+            }
+            /* white: a push swaps it; the plain turn is S.TONE (right opens), Shift + turn SAMPATT */
+            white_smp = 0; host_knobs[0][2] = 20000;
+            CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 2, 1024) == 0, "white turns the OP-1's tone until it is swapped");
+            ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 0);
+            host_eng_rec[0][REC_STONE] = 10000;
+            const int t1 = ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 2, 2048);
+            const int st_after = host_eng_rec[0][REC_STONE];
+            host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 2, 4096); host_shift_held = 0;
+            CHECK(t1 && white_smp && st_after == 10000 - 2048 && host_eng_rec[0][REC_SHP] == 1024 && host_knobs[0][2] == 20000,
+                  "pushed: white turns S.TONE (opening: %d) and Shift + white SMP HPF (%d, at the Shift rate), the note's tone kept", st_after, host_eng_rec[0][REC_SHP]);
+            ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 2, 0);
+            CHECK(!white_smp, "pushed again: TONE and SUB");
+            host_eng_rec[0][REC_STONE] = 0; host_eng_rec[0][REC_SATK] = 0; host_eng_rec[0][REC_SHP] = 0;
+        }
+        /* the controls: a green push swaps green; the turns go to the record */
+        smp_rec(0, 0, 0); host_knobs[0][1] = 1000; green_smp = 0;
+        CHECK(ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 1, 1024) == 0, "green turns the OP-1's knock until it is swapped");
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 0);
+        int took = ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 1, 4096);
+        CHECK(took && green_smp && host_eng_rec[0][REC_SLVL] == 4096 && host_knobs[0][1] == 1000, "pushed: a plain green turn is SAMPLE (4 detents: %d), knock kept", host_eng_rec[0][REC_SLVL]);
+        host_shift_held = 1;
+        int16_t rr[REC_N];
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 1, 4 * 1024); rec_get(0, rr);
+        const int att4 = rr[REC_SATK];
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 1, 40 * 1024); rec_get(0, rr);
+        const int a_top = rr[REC_SATK];
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 1, -60 * 1024); rec_get(0, rr);
+        CHECK(att4 == 4096 && a_top == 32767 && rr[REC_SATK] == 0 && rr[REC_STUNE] == 0, "Shift + green: SMP ATK, 32 detents end to end (%d after 4), the tune untouched", att4);
+        /* SMP TUNE, Shift + blue on blue's DRIVE page: a semitone a detent, -24 .. +24 */
+        blue_pg = 1;
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 3 * 1024); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, -512);
+        rec_get(0, rr);
+        const int t3 = rr[REC_STUNE];
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, 40 * 1024); rec_get(0, rr);
+        const int t12 = rr[REC_STUNE];
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 0, -60 * 1024); rec_get(0, rr);
+        blue_pg = 0;
+        CHECK(t3 == 3 && t12 == 24 && rr[REC_STUNE] == -24 && host_eng_rec[0][REC_STUNE] == 1, "Shift + blue (DRIVE page): SMP TUNE a semitone a detent, -24 .. +24 (%d, %d, %d)", t3, t12, rr[REC_STUNE]);
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 0);
+        const int sh_back = !green_smp;
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 0);
+        host_shift_held = 0;
+        CHECK(sh_back && green_smp, "a green push with Shift held swaps both ways too: back to knock, then to the sample again");
+        ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 1, 0);
+        CHECK(!green_smp && ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_TURN, 1, 1024) == 0, "pushed again: green is knock again");
+        int seq[10];
+        for (int i = 0; i < 10; i++) { ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 1, 1); ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_PUSH, 1, 0); rec_get(0, rr); seq[i] = rr[REC_SRC]; }
+        CHECK(seq[0] == 2 && seq[6] == 8 && seq[7] == SRC_AUTO && seq[8] == 2, "T2 green push: AUTO, 2 .. 8 (not tyr8's own slot 1), AUTO (%d %d .. %d %d %d)", seq[0], seq[1], seq[6], seq[7], seq[8]);
+        CHECK(ENGINE_tyr8.input(OP1_ENG_T2, OP1_ENG_TURN, 1, 1024) == 0, "T2 turns stay the OP-1's envelope");
+        smp_rec(0, 0, 0); no_samples();
+        free(ref);
+    }
+
     /* a phrase to listen to */
     reset(); set(10000, 14000, 6000, 20000, 14000, 12000, 0, 60);
     const double ph_hz[8] = { 43.65, 43.65, 51.91, 43.65, 65.41, 58.27, 43.65, 38.89 };
@@ -837,6 +1181,23 @@ int main(int argc, char **argv)
     rise(0); sag(32767);
     CHECK(!offscreen, "nothing goes off the screen or below its lower margin, at the largest size, flat or blown up, lowrider, bouncing");
     host_knobs[0][1] = 32767; for (int i = 0; i < 40; i++) { frame("rough road, rolling"); escapes += dyn_escapes(); } host_knobs[0][1] = 20000;
+    { /* the easter egg: Shift + orange push on T1 turns the sidewall's markings on and off (a plain one doesn't); they
+       * stay inside the moving area over a turn, on the plain sidewall and the whitewall, flat or not */
+      const int was = tyre_badge;
+      host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 0); host_shift_held = 0;
+      const int on = tyre_badge;
+      ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 0);
+      const int plain = tyre_badge;
+      int esc = 0, marks = 0;
+      for (int k = 0; k < 4; k++) {
+          sub(k & 1 ? 32767 : 0); sag(k & 2 ? 32767 : 0);
+          for (int i = 0; i < 30; i++) { frame(k == 0 ? "markings: GRIFTY, TYR8, the flag" : "markings, rolling"); esc += dyn_escapes(); }
+          for (int j = 0; j < nlines; j++) marks += lines[j].c[0] == 0 && lines[j].c[1] == 0 && lines[j].c[2] == 0;   /* black on a whitewall */
+      }
+      host_shift_held = 1; ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 1); ENGINE_tyr8.input(OP1_ENG_T1, OP1_ENG_PUSH, 3, 0); host_shift_held = 0;
+      CHECK(!was && on && plain && !tyre_badge && esc == 0 && marks > 20,
+            "Shift + orange push: the sidewall markings on (a plain push leaves them) and off again; over a turn they stay in the moving area (%d escapes, %d black strokes on the whitewall)", esc, marks);
+      sub(32767); sag(32767); }
     CHECK(escapes == 0 && dyn_from > 0, "no moving stroke or fill reaches the still label layer (%d escapes)", escapes);
     { /* every size, slick and lugs, flat, round and blown up, knock 0 and full, kicked off the road again and again:
        * nothing reaches the label layer, and the red strain line stays on the tyre */
@@ -886,9 +1247,10 @@ int main(int argc, char **argv)
     CHECK(!bad && !bad2, "labels stay in their corners, clear of the tyre (largest, flat), the road and the screen edge");
     mode(MODE_RETRIG); frame("mode: mono retrig"); TEXT_SCAN(txt2, bad2, cor2); mode(MODE_GLIDE);
     CHECK(!bad2, "the longest mode name fits");
-    host_shift_held = 1; blue_clip = 1; frame("shift held, blue on clip"); int txt3, bad3, cor3[4]; TEXT_SCAN(txt3, bad3, cor3);
-    CHECK(!bad3 && txt3 != txt, "Shift with blue switched shows clip, and fits (%d strokes)", txt3);
-    blue_clip = 0; host_shift_held = 0; sub(0); sag(0);
+    host_shift_held = 1; blue_pg = 1; frame("shift held, blue on the DRIVE page: SMP TUNE"); int txt3, bad3, cor3[4]; TEXT_SCAN(txt3, bad3, cor3);
+    host_shift_held = 0; frame("blue on the DRIVE page"); { int t5, b5, c5[4]; TEXT_SCAN(t5, b5, c5);
+    CHECK(!bad3 && !b5 && txt3 != txt && c5[0] > 8, "blue's DRIVE page shows DRIVE, and SMP TUNE with Shift, and they fit (%d strokes)", txt3); }
+    blue_pg = 0; host_shift_held = 0; sub(0); sag(0);
     host_knobs[0][0] = 0; frame("shape at -50 %"); TEXT_SCAN(txt3, bad3, cor3);
     CHECK(!bad3, "the shape value fits with its sign");
     host_knobs[0][0] = 8192;
@@ -898,8 +1260,28 @@ int main(int argc, char **argv)
     CHECK(!bad3, "sag -100 %% fits, with its sign");
     host_shift_held = 0;
 
+    green_smp = 1; white_smp = 1; smp_rec(19661, 5, 0); host_eng_rec[0][REC_STONE] = 8192; host_eng_rec[0][REC_SATK] = 32767; host_eng_rec[0][REC_SHP] = 16384;
+    frame("green and white on the sample: SAMPLE 60 %, S.TONE 75 %"); TEXT_SCAN(txt3, bad3, cor3);
+    unsigned hg; TEXT_HASH(hg);
+    host_shift_held = 1; frame("shift, on the sample: SMP ATK 100 MS, SMP HPF 50 %"); { int t4, b4, c4[4]; TEXT_SCAN(t4, b4, c4);
+    CHECK(!bad3 && !b4 && cor3[1] > 8 && c4[1] > 8 && cor3[2] > 8 && c4[2] > 8, "green and white swapped: SAMPLE, SMP ATK, S.TONE and SMP HPF fit in their corners"); }
+    host_shift_held = 0; green_smp = 0; white_smp = 0; smp_rec(0, 0, 0); host_eng_rec[0][REC_STONE] = 0; host_eng_rec[0][REC_SATK] = 0; host_eng_rec[0][REC_SHP] = 0; (void)hg;
+
+    { /* every name beside its longest value, with a gap: KNOCK LEN once ran into 855MS */
+      static const char *const pairs[][2] = { { "SHAPE", "-50%" }, { "DRIVE", "100%" }, { "CLIP", "100%" }, { "KNOCK", "100%" },
+          { "KNCKLEN", "999MS" }, { "SMP HPF", "100%" }, { "TONE", "100%" }, { "SUB", "100%" }, { "SAG", "-100%" }, { "GLIDE", "500MS" },
+          { "SAMPLE", "100%" }, { "SMP REV", "100%" }, { "SMP TUNE", "-24" }, { "S.TONE", "100%" }, { "SMP ATK", "100MS" },
+          { "ATTACK", "999MS" }, { "DECAY", "4.0S" }, { "SUSTAIN", "100%" }, { "RELEASE", "999MS" } };
+      int worst = 1 << 30; const char *wn = "";
+      for (unsigned i = 0; i < sizeof pairs / sizeof pairs[0]; i++) {
+          const int gap = OP1_Q10(LBL_W) + OP1_Q10(2) - sq_width(LBL_S, pairs[i][1]) - sq_width(LBL_S, pairs[i][0]);
+          if (gap < worst) { worst = gap; wn = pairs[i][0]; }
+      }
+      CHECK(worst >= OP1_Q10(4), "every label's name clears its longest value by 4 px or more (closest: %s, %.1f px)", wn, worst / 1024.0); }
+
     /* the T2 page: the envelope curve and four labels */
 #define T2_FRAME(label) frame_of(&SCREEN_tyr8_t2, label)
+    sil_n = 0; road_nseg = 0;                                  /* T2 has no tyre and no road: only the screen's edges count */
     host_t2[0][0] = t2_of(0.2); host_t2[0][1] = t2_of(0.5); host_t2[0][2] = 16384; host_t2[0][3] = t2_of(0.5);
     T2_FRAME("T2: attack, decay, sustain half, release");
     int curve = 0, outside = 0; for (int j = 0; j < nlines; j++) { if (lines[j].w != 1024) curve++;
@@ -913,6 +1295,20 @@ int main(int argc, char **argv)
     host_t2[0][0] = T2_LO; host_t2[0][1] = T2_LO; host_t2[0][2] = 0; host_t2[0][3] = T2_LO; T2_FRAME("T2: all down");
     TEXT_SCAN(txt3, bad3, cor3);
     CHECK(!bad3, "T2: the shortest values fit");
+    { /* the sample's source under green's block: in green with a recording, grey without; above the curve */
+      host_t2[0][0] = t2_of(0.2); host_t2[0][1] = t2_of(0.5); host_t2[0][2] = 16384; host_t2[0][3] = t2_of(0.5);
+      int lo_y = 1 << 30, hi_y = 0, grn = 0, gry = 0;
+      make_click(2, 3000, 1500); smp_rec(32767, 0, 0); for (int i = 0; i < 20; i++) T2_FRAME("T2: SMP AUTO 3");
+      for (int j = 0; j < nlines; j++) if (lines[j].w == 1024 && lines[j].y0 > OP1_Q10(20) && lines[j].y0 < OP1_Q10(33)) {
+          grn += !memcmp(lines[j].c, COL_KNOB[1], 3);
+          const int32_t ya = lines[j].y0 < lines[j].y1 ? lines[j].y0 : lines[j].y1, yb = lines[j].y0 > lines[j].y1 ? lines[j].y0 : lines[j].y1;
+          if (ya < lo_y) lo_y = ya;
+          if (yb > hi_y) hi_y = yb; }
+      TEXT_SCAN(txt3, bad3, cor3);
+      no_samples(); smp_rec(32767, 0, 5); T2_FRAME("T2: SMP 5 -, no recording");
+      for (int j = 0; j < nlines; j++) if (lines[j].w == 1024 && lines[j].y0 > OP1_Q10(20) && lines[j].y0 < OP1_Q10(33)) gry += !memcmp(lines[j].c, COL_GREY, 3);
+      CHECK(grn > 10 && gry > 10 && !bad3 && lo_y > OP1_Q10(20) && hi_y < OP1_Q10(ENV_TOP), "T2: the sample's source under green's block, green with a recording, grey without, above the curve (%d, %d strokes)", grn, gry);
+      smp_rec(0, 0, 0); }
     if (fj) { fprintf(fj, "]\n"); fclose(fj); }
 
     printf("audio hash %08x\n", audio_hash);

@@ -196,8 +196,8 @@ Since 0.9.4 there are no push pages. The layout was the owner's own design (2026
 
 | Encoder | T1 turn (word) | T1 Shift + turn | T2 (R246's envelope words) |
 |---|---|---|---|
-| Blue | `SHAPE` (0) | `DRIVE` (5) or `CLIP` (6); Shift + push switches | `ATTACK` 0..1 s |
-| Green | `KNOCK` (1) | `KNOCK LEN` (7) | `DECAY` 0.1..4 s |
+| Blue | `SHAPE` (0), or on the DRIVE page `DRIVE` (5) | `CLIP` (6), or on the DRIVE page `SMP TUNE` (record 9) | `ATTACK` 0..1 s |
+| Green | `KNOCK` (1) | `KNCKLEN` (7) | `DECAY` 0.1..4 s |
 | White | `TONE` (2) | `SUB` (record 5) | `SUSTAIN` |
 | Orange | `SAG` (3, and record 7 below 0) | `GLIDE` (record 6) | `RELEASE` 10 ms..4 s, top 5 % `HOLD` |
 
@@ -208,8 +208,56 @@ Since 0.9.4 there are no push pages. The layout was the owner's own design (2026
   handling. It steps by `delta / 4` (256 a detent, more when turned fast), the same rate as the core's fine Shift
   turn. Words go through `op1_engine_word_set`, record values through `op1_engine_record_store`.
   `op1_engine_shift` is no longer called.
-- **Pushes:** orange steps the play mode (record 0), with or without Shift. Shift + blue toggles `blue_clip`, a
-  UI-only flag that is **not saved**. Other pushes are taken and do nothing.
+- **Pushes:** a T2 orange push steps the play mode (record 0), shown under RELEASE on T2 (0.9.36; it was a T1 orange
+  push, shown under orange's T1 block); a T1 orange push does nothing. A blue push (either way) toggles `blue_pg`, a
+  UI-only flag that is **not saved** (see Blue's pages below). Green (either way) toggles `green_smp`, also not saved: while it is on, the plain
+  green turn is `SAMPLE` (record 8, `delta` a step) and Shift + green `SMP ATK` (record 13, `delta`; 0.9.35, it was
+  SMP TUNE), both taken by `ty_input`. White's push is taken and does nothing.
+- **Sample layer (0.9.25).** `find_source` / `scan` are UZ-1's: the first other slot (or record 10's slot) whose
+  sampler buffer has peaks over -42 dBFS, from just before its first loud sample to its last loud bucket. Scanned on
+  the key thread in `ty_note_on` (only with `SAMPLE` up, at most every 64 render calls, or at once after
+  `src_force`), double buffered in `srcb[src_i]` for render. From 0.9.26 `scan` keeps inside the sampler's own START
+  and END markers when the slot's engine is the sampler (`slot_is_sampler`: R246's synth type table at 0xFF8016E4,
+  engine 6, as kennel's kn_sampler.c reads it): knob words 0 and 3 of that slot, fractions of the 264592-sample buffer,
+  32768 = 1.0. Loop points (words 1, 2) and its envelope are not read.
+- **The sampler's tune, gain and direction (0.9.27)**, from sampler+'s bit-exact model of R246's sampler voice
+  (`samplerplus/sp_voice.c`): the read step is `mult_fr1x32x32(inc, rate) >> 7` = `inc × rate >> 38`, Q12 samples
+  a voice sample, where `inc` is the key's phase increment and `rate` the slot's sampler object +4 (Q31, 88200 /
+  (base_freq × 16384), set by `sampler_set_base_freq`). TYR8 takes `own_inc` at the restart and follows it every block (0.9.30) (the key itself, before
+  `OCT_DOWN`), so the layer follows the key exactly as the sampler would, then × 2^(SMP TUNE / 12). Gain: word 7,
+  g = `(w7² × 2 + 0x8000) >> 16`; the sampler's `sp_tap` plays the sample × g / 2048, saturated at full scale (0 dB at
+  w7 8192, +24 dB at the top). From 0.9.37 TYR8 does the same (`sg`, Q11, then a clip at ±32767) before SMP HPF and
+  both paths, and `SAMPLE` scales what comes out; 0.9.27 .. 0.9.36 took g as Q15 (the top as 0 dB: 16× too quiet). Direction: word 4 ≥ 0x4000 is reverse (record 11's flip, 0.9.27 .. 0.9.33, is gone from 0.9.34). A slot that is
+  not the sampler (or a rate outside 1/64..32× middle C's) plays as if based at middle C (`RATE_C4`), at 0 dB,
+  forwards. The playhead is a Q12 position (`sp`, the buffer's 264592 samples fit), stepping by `sst` (negative
+  backwards) between `slo` and `shi`.
+- **The sample's own chain (0.9.28).** The block's sample pass (`smp[]` in `ty_render`) runs each sample through a
+  copy of run_block's stage 1 .. stage 2 (same `g1`, `mix`, `cpl`, `lift`, `g2`, `clip`; no bias; its own coupling and
+  lift states `sdc`, `slp`), then S.TONE (`tone_tc(record 12)`, its own `sz1`, `sz2`), then SMP ATK's linear fade-in
+  (`sra`, `sri`; record 13, 0..100 ms by a square law; from 0.9.31 after the drive and S.TONE: before the drive, the
+  drive undid it). `run_block` adds `sb[n]` after the tone, before
+  feedback's tap and the clipper. After the recording ends the chain gets 1024 voice samples to ring, then a 1024
+  sample fade (`sfo`): the coupling's rounding can hold a few LSBs for ever, so it never reached a "silent" test.
+  White's push toggles `white_smp` (not saved): the plain white turn is S.TONE (record 12 holds how far closed, so 0
+  is open for old sounds; `delta` a step, right opens), Shift + white `SMP HPF` (record 14, `delta / 4`; 0.9.35, it was SAMPATT).
+- **The top of SAMPLE (0.9.33).** `smp_solo(level)`: 0 up to `SMP_SOLO` (24576, 75 %), then to 32768 at 100 %, as
+  `sws` (ramped a quarter a block, set at a restart; only while `shad`, the note started a sample). The layered path's
+  level stops at SMP_SOLO's. `run_block` scales the body by `bw` = (1 - sws), Q11, after its drive and tone and before
+  `sb[n]` is added, so the sample alone still goes through the clipper; the sub's clean sine is scaled the same.
+  At `bw` 2048 the product is exact (bit-identical below 75 %). At sws 32768 the voice ends when the sample does.
+  (0.9.33 .. 0.9.37 had a clean path, `cln[]`, straight to the output instead: a workaround for the misread sampler
+  gain, removed in 0.9.38.)
+- **Blue's pages (0.9.29).** A blue push toggles `blue_pg` (not saved; replaced `blue_clip`). Page 0: the plain turn is
+  the OP-1's word 0 (shape), Shift + blue clip (word 6). Page 1: `ty_input` takes the plain turn for drive (word 5,
+  `delta` a step, through `op1_engine_word_set`) and Shift + blue for `SMP TUNE` (record 9, `op1_eng_detents`, a semitone a detent; 0.9.35, it was SMP HPF). SMP HPF is
+  two one-pole high-passes on the interpolated sample (Q15, states Q15 << 8, coefficient `hpf_c`, Q15, 30 Hz .. 3 kHz
+  even in octaves), before the sample's drive copy. A restart (never a legato note) starts a playhead
+  (`sd`, `si`, `se`, `sfr`, `sst`: 0.5 a voice sample at no tune, `exp2neg` for the semitones). Render fills `smp[]`
+  once a block (interpolated, the last 512 samples faded, × level² up to 2× × stage 1's gain `g1`) and `run_block`
+  adds `sb[n]` to x right after the envelope × stage-1 multiply: it goes through stage 1, the coupling, stage 2, tone,
+  feedback's tap and the clipper, but not the amp envelope. `live` stays 1 while it plays. With `SAMPLE` at 0 the
+  samples are bit-identical to having no sample at all (a check). The T2 page scans on its own every 300 ms for the
+  `SMP` line.
 - **T2:** `"t2_page": true` (needs `own_envelope`). R246's T2 knobs keep turning the slot's four envelope words
   (attack, decay, release 64..16320; sustain 0..32767), saved with the sound as its `"adsr"`. `t2_get()` reads them
   with `op1_t2_words(slot)` and normalises to 0..32767; all four 0 (never on the OP-1) reads as the 808 defaults.
@@ -217,7 +265,9 @@ Since 0.9.4 there are no push pages. The layout was the owner's own design (2026
   previous envelope words, so a new TYR8 sound starts with whatever envelope the slot had.
 - **Envelope rule:** while the key is down the level falls to sustain at the decay rate; after it is up it falls to 0
   at the release rate, or at the decay rate with `HOLD`. Sustain 0 + `HOLD` is the 808 one-shot.
-- **Record layout** (`REC_*`): `[0]` mode, `[5]` sub, `[6]` glide, `[7]` sag's rise (0.9.13), each 0..32767. `[1]..[4]` held 0.9.3's push-page
+- **Record layout** (`REC_*`): `[0]` mode, `[5]` sub, `[6]` glide, `[7]` sag's rise (0.9.13), each 0..32767;
+  `[8]` sample level, `[9]` sample tune stored as 13 + semitones (0 = none, so an old sound reads 0 semitones; record
+  values are kept non-negative), `[10]` sample source (0 AUTO, 1..8; 0.9.25). `rec_put` writes it back. `[1]..[4]` held 0.9.3's push-page
   values and are ignored.
 - **Defaults** (`plugin.json`, from 0.9.22): words `[8192, 0, 32767, 0]` and page-2 `[0, 0, 0]`: plain sine, no
   knock, tone open, no sag, drive 0, clip 0, knock length at its shortest (20 ms). With no record yet (`rec_get`, `!r`)
@@ -368,11 +418,25 @@ the raster's pixels** (`fill_poly`, even-odd scanline, RGB565, the layout dx_gfx
 - **Layout limits:** the largest, flattest tyre stays clear of the label blocks and above y = 150; the tests check
   the real silhouette, and every road line, against the label text.
 - **Still labels (0.9.12):** `op1_screen_regions` declares the moving area (`DYN`, the screen outside the label
-  text and gauges plus 1 px); the labels and the mode are drawn only in the `op1_screen_static` pass, and
+  text and gauges plus 1 px); the labels are drawn only in the `op1_screen_static` pass, and
   `op1_screen_static_dirty` is called when a hash of what they say changes. Nothing that moves may reach the still
   layer, or it would never be erased there: the street is cut at `KEEP_OUT` (the still area plus 3 px, out to the
   screen edges) and the largest tyre is sized to stay inside; the test `dyn_escapes` checks every moving stroke
   (with its width) and fill. **Untested on hardware;** if labels flicker or leave trails, drop the region calls.
+  The lower blocks sit at `LBL_YB_T1` (130) on T1, `LBL_YB_T2` (106) on T2, where the mode goes under orange (0.9.36).
+- **The easter egg (0.9.39):** Shift + orange push on T1 toggles `tyre_badge` (not saved; `TYRE_BADGE_ON` sets its
+  start, for previews). `wheel()` then draws the sidewall markings through `side_mark()`: GRIFTY at 9 o'clock, TYR8 at
+  3, a 10 × 2 checkered flag at 6 (0.9.40; 5 × 2 in 0.9.39), with the valve (`a0 + 600`) at 12; angular stroke glyphs (`GLYPHS`, 5 rows) mapped
+  through `wp`, so they tilt, squash and turn with the tyre. On the plain sidewall between the rim and the groove line;
+  on a whitewall black on the band when it is 6 px or more, else white above the pinstripe; under 4 px tall a white
+  bar (`side_bar`). Not in the README, on purpose; the CHANGELOG only hints.
+- **Sub and sample (0.9.40):** the sub's crossfade weight is `sub × dk[n]` (Q11): `dk`, filled by the sample pass,
+  is the body's share `bw` × (1 − duck), duck from a follower on the sample's output (`sde`: at once up, a 512-sample
+  time constant down; all of the duck from Q18_ONE / 8). With no sample this block `dk` is 0 and the weight is
+  `sub × bw` (bit-identical below 75 %). The clean sine itself is no longer scaled by `bw`.
+- **Near sidewalk (0.9.39):** `draw_road`'s front pass (after the wheel, not culled) draws the near curb's top at
+  `ROAD_P0`, its front 4 px nearer, the sidewalk's front edge `WALK_W` beyond, the slab joints, and (0.9.40) grass beyond it, as the far side's.
+  The centre line is `COL_LINE` (yellow).
 - **Hidden lines (0.9.12):** `wheel_prep` builds the silhouette first; road lines behind it are clipped to what
   sticks out (`hull_in`, Cyrus-Beck), rocks wholly behind it and lug faces inside the near face are skipped.
 - **Cost:** 335 to 560 raster lines on an ordinary frame (0.9.12; was 535 to 850), plus about 40 fills, on the GUI thread. If the OP-1's screen gets slow,
@@ -490,8 +554,8 @@ changes as it decays and that looked like noise. Check what a metric is really m
   text. `-O3`, unrolling and scheduling flags made no difference to the loop. Poly was later removed (0.9.9). The test prints an `audio hash` of
   every sample it renders: a speed-up must leave it unchanged (`751ed29c` at 0.9.5, `f4c381f0` from 0.9.7, when the sub
   moved; `46bb11db` from 0.9.9, the tail fade).
-- **`blue_clip` (Shift + blue on drive or clip) is global and unsaved.** It carries across sounds and slots and
-  resets at power-on. The label shows it only while Shift is held.
+- **`blue_pg`, `green_smp` and `white_smp` (the swapped pages) are global and unsaved.** They carry across sounds and
+  slots and reset at power-on. The labels show them.
 - **The T2 page and the Shift-turn takeover (0.9.4) are untested on hardware.** They follow the SDK headers and
   pinboard's example. Check that T2 shows TYR8's page, that its knobs move the curve, and that every Shift + turn on T1
   moves its value at a sensible rate.
@@ -519,7 +583,8 @@ changes as it decays and that looked like noise. Check what a metric is really m
 
 - **Velocity to drive or knock.** Skipped: the OP-1's keys always play at full velocity, so it only helps with
   sequencers and external MIDI.
-- **A noise or click transient layer.** Skipped twice in favour of the pitch knock.
+- **A noise or click transient layer.** Skipped twice in favour of the pitch knock; 0.9.25 built a sampled one
+  instead (the sample layer), from a recording on another slot.
 - **Boosting the summed synth bus** for more level. The SDK has a hook (`"sum_block"`); I never checked whether
   it permits gain above full scale.
 - **Going straight from sine to saw,** dropping the triangle, if the first half of the plain range still feels

@@ -1,5 +1,107 @@
 # Changelog
 
+## 0.9.40
+- SUB and the sample layer no longer fight. SUB crossfades the output to its clean sine (at 100 % all of it), which
+  took the sample with it: SUB 100 % and SAMPLE 100 % left almost nothing, and at lower SAMPLE the sample was lost
+  under the sine. Now the sub steps aside while a sample plays (a level follower on the sample: all the way from an
+  eighth of full scale, back over a few ms after it), and above 75 % SAMPLE it fades out with the 808. With no
+  sample it is as it was.
+- Grass beyond the near sidewalk too.
+- The tyre's new thing is longer.
+
+## 0.9.39
+- The street has a sidewalk on the near side too: a curb at the road's edge and a sidewalk with its joints, in front
+  of the tyre, scrolling with it.
+- The road's centre line is yellow.
+- Something new on the tyre, for whoever goes looking.
+
+## 0.9.38
+- The top of `SAMPLE` crossfades before the clipper: from 75 to 100 % the 808 and its sub fade out after the drive
+  and tone, and the sample carries on through its drive and the clipper, so DRIVE and CLIP still shape it at 100 %.
+  The clean path straight to the output (0.9.33) is gone: it was there to make the sample hit, and with the
+  sampler's gain read right (0.9.37) it hits through the clipper.
+
+## 0.9.37
+- The sampler's gain is taken as the sampler plays it: a quarter of its knob is 0 dB and the top +24 dB, with the
+  sampler's hard clip at full scale. TYR8 took the top of the knob as 0 dB, so a sample boosted on the sampler came
+  out up to 16x (24 dB) quieter in TYR8, and never clipped. The gain and clip come first, as on the sampler, then SMP
+  HPF and the rest: at SAMPLE 100 % a slammed, squared-off sample on the sampler is slammed and squared off in TYR8.
+  Sounds whose source sampler has its gain above a quarter now play the sample louder.
+
+## 0.9.36
+- The play mode moved to T2: push orange there to switch between MONO GLIDE and MONO RETRIG, shown under RELEASE.
+  A T1 orange push no longer does anything.
+- T1's lower labels (white and orange) sit in the bottom corners, as far from the edge as the top ones are.
+
+## 0.9.35
+- The sample's Shift + turns moved: `SMP TUNE` is Shift + blue on blue's DRIVE page (it was Shift + green), the attack
+  fade is Shift + green on the sample page, renamed `SMP ATK` (it was `SAMPATT` on Shift + white), and `SMP HPF` is
+  Shift + white on the sample page (it was Shift + blue). The plain turns are as they were: DRIVE, SAMPLE, S.TONE.
+
+## 0.9.34
+- Green's push swaps between knock and the sample layer with or without Shift, as blue's and white's do. Shift +
+  green push on the sample used to flip the sample's direction instead, so green couldn't be swapped back with Shift
+  held. The flip is gone: the sample plays the way the sampler is set to (sounds saved with it flipped play the
+  sampler's way).
+
+## 0.9.33
+- The top of `SAMPLE` crossfades to the sample alone. Up to 75 % it is layered on the 808 as before (75 % is the old
+  100 %'s layering at a little over half its level). From 75 to 100 % the body and sub fade out after the clipper and
+  the sample crosses to a clean path straight to the output, at the sampler's own level (recording x its gain x
+  velocity), not saturated or clipped: at 100 % it hits as it does on the sampler. SMP HPF, S.TONE, SAMPATT, SMP TUNE
+  and ATTACK apply to it, DRIVE and CLIP don't. With no recording found the note plays as usual. A new note that cuts
+  the clean sample carries on from it over 1.5 ms (no click), and at 100 % the voice is free once the sample is done.
+  Sounds saved with SAMPLE above 75 % now play with less body under the sample.
+
+## 0.9.32
+- `SAMPATT` turns at full speed, 32 detents end to end (it was 128, and the first 10 stayed under 1 ms): a quarter of
+  the turn is 6 ms, half 25 ms, all of it 100 ms.
+
+## 0.9.31
+- `SAMPATT` fades the sample in after its drive and `S.TONE`, not before them. Before the drive, the drive pushed the
+  faded start back up: at full drive a 25 ms fade left the click's first 4 ms at about 90 % of their treble. Now the
+  fade is the same at any drive (under 1 % there).
+
+## 0.9.30
+- The sample layer's pitch follows the key's pitch block by block, as the OP-1's sampler does, instead of taking it
+  from the note's first sample. A new note's pitch can still be on its way from the note before (portamento, or the
+  OP-1's own smoothing), so a low note played after a high one played its sample a little sharp for a hit or two.
+  A legato note (MONO GLIDE) doesn't bend the sample still playing from the note before.
+
+## 0.9.29
+- Blue has two pages, switched by a blue push (with or without Shift): SHAPE with CLIP on Shift, and DRIVE with
+  `SMP HPF` on Shift. Shift + blue push used to switch Shift + blue between drive and clip.
+- `SMP HPF`: a 12 dB / octave high-pass on the sample layer before its drive, off at 0, then 30 Hz to 3 kHz, so a
+  sample's low end can be taken out to sit on the 808. Saved with the sound (record 14).
+
+## 0.9.28
+- The sample layer has its own tone: push white to swap TONE and SUB for `S.TONE` (the sample's own low-pass) and
+  `SAMPATT` (a fade-in, 0 .. 100 ms, rolling off its attack); push again to swap back. The sample now runs through
+  its own copy of the drive and joins the note after TONE, before the clipper, so TONE no longer darkens it. When it
+  ends, its chain rings out for 12 ms and fades over 12 more.
+- `KNOCK LEN` is `KNCKLEN`: at values like 855 ms the name ran into the value. A check now holds every label clear of
+  its longest value.
+
+## 0.9.27
+- The sample layer starts from the sampler's own settings: its tune (the sample follows the key you play, at the
+  pitch the sampler would give that key), its gain (scales SAMPLE) and its direction (reverse plays backwards). TYR8's
+  controls go from there: SMP TUNE is now -24 .. +24 semitones on top of the sampler's tune, and Shift + green push
+  (on the sample) plays it the other way round from the sampler; SAMPLE reads SMP REV while it plays backwards.
+  Saved with the sound (record 9 now holds 25 + semitones, record 11 the flip).
+
+## 0.9.26
+- The sample layer follows the sampler's own trim: it plays between the start and end points set on the sampler's
+  page (the slot's knob words 0 and 3), picked up on the next note. A slot that no longer runs the sampler plays its
+  whole recording. The sampler's tune, loop and envelope still don't apply.
+
+## 0.9.25
+- A sample layer: push green to swap it over to `SAMPLE` (level, 0 off .. 100 %) and, with Shift, `SMP TUNE`
+  (-12 .. +12 semitones); push again for knock and knock length. It plays a recording made with the OP-1's sampler on
+  another slot (the silence before it skipped), once on every new note, mixed in at the oscillator's stage after the
+  amp envelope: drive, tone and the clipper shape it too, and it plays whole whatever the decay. Glided legato notes
+  don't play it. On T2 a green push picks the slot (AUTO, the first other slot with a recording, or 1 .. 8); the line
+  under DECAY shows it. Saved with the sound (record 8 .. 10); older sounds load with it off.
+
 ## 0.9.24
 - Fixed: a click on every key press in the OP-1's poly mode, legato too, at any setting. TYR8 is mono and moved its
   one sound to each new key's OP-1 voice, and the OP-1's handling of each voice's output made the move audible (its
